@@ -3,6 +3,8 @@
 
 # Track these files
 !.gitignore
+!.github/
+!.github/**
 !index.html
 !index-dev.html
 !build.sh

@@ -1844,7 +1844,8 @@ function BatteryStateChart({
 // ===== PERFORMANCE MANAGEMENT CHART =====
 function PerformanceManagementChart({
   cpmsData,
-  batteryEvents
+  batteryEvents,
+  sbcData
 }) {
   const mobile = useIsMobile();
   const [timeRange, setTimeRange] = useState('3d');
@@ -1873,6 +1874,21 @@ function PerformanceManagementChart({
     axis: 'y-cap',
     fill: true
   }, {
+    key: 'rss',
+    label: 'RSS (mΩ)',
+    color: '#f47067',
+    source: 'sbc',
+    field: 'RSS',
+    axis: 'y-rss'
+  }, {
+    key: 'resscale',
+    label: 'ResScale',
+    color: '#e3b341',
+    source: 'sbc',
+    field: 'ResScale',
+    axis: 'y-resscale',
+    dash: [4, 2]
+  }, {
     key: 'temp',
     label: 'Battery Temp (°C)',
     color: '#3fb950',
@@ -1895,11 +1911,12 @@ function PerformanceManagementChart({
     field: 'Amperage',
     axis: 'y-amp'
   }];
-  const [selectedMetrics, setSelectedMetrics] = useState(new Set(['sysCap0', 'sysCap1', 'sysCap2', 'temp']));
+  const [selectedMetrics, setSelectedMetrics] = useState(new Set(['sysCap0', 'sysCap1', 'sysCap2', 'rss']));
   const chartRef = useRef(null);
   const chartInstance = useRef(null);
   const filteredCpms = useMemo(() => filterByTimeRange(cpmsData, timeRange, null), [cpmsData, timeRange]);
   const filteredBat = useMemo(() => filterByTimeRange(batteryEvents, timeRange, null), [batteryEvents, timeRange]);
+  const filteredSbc = useMemo(() => filterByTimeRange(sbcData || [], timeRange, null), [sbcData, timeRange]);
   const toggleMetric = key => {
     setSelectedMetrics(prev => {
       const next = new Set(prev);
@@ -1909,6 +1926,7 @@ function PerformanceManagementChart({
   };
   const hasData = m => {
     if (m.source === 'cpms') return filteredCpms.length > 0;
+    if (m.source === 'sbc') return filteredSbc.length > 0;
     return filteredBat.length > 0;
   };
   useEffect(() => {
@@ -1916,12 +1934,12 @@ function PerformanceManagementChart({
       chartInstance.current.destroy();
       chartInstance.current = null;
     }
-    if (!chartRef.current || filteredCpms.length === 0) return;
+    if (!chartRef.current || filteredCpms.length === 0 && filteredSbc.length === 0 && filteredBat.length === 0) return;
     try {
       const datasets = [];
       const activeMetrics = METRIC_DEFS.filter(m => selectedMetrics.has(m.key) && hasData(m));
       activeMetrics.forEach(m => {
-        const source = m.source === 'cpms' ? filteredCpms : filteredBat;
+        const source = m.source === 'cpms' ? filteredCpms : m.source === 'sbc' ? filteredSbc : filteredBat;
         datasets.push({
           label: m.label,
           data: source.map(row => ({
@@ -1943,6 +1961,8 @@ function PerformanceManagementChart({
       const hasVoltage = activeMetrics.some(m => m.axis === 'y-voltage');
       const hasAmp = activeMetrics.some(m => m.axis === 'y-amp');
       const hasTemp = activeMetrics.some(m => m.axis === 'y-temp');
+      const hasRss = activeMetrics.some(m => m.axis === 'y-rss');
+      const hasResScale = activeMetrics.some(m => m.axis === 'y-resscale');
       const ctx = chartRef.current.getContext('2d');
       chartInstance.current = new Chart(ctx, {
         type: 'line',
@@ -1970,6 +1990,8 @@ function PerformanceManagementChart({
                 label: ctx => {
                   const v = ctx.parsed.y;
                   if (ctx.dataset.label.includes('Temp')) return `${ctx.dataset.label}: ${v.toFixed(1)}°C`;
+                  if (ctx.dataset.label.includes('RSS')) return `${ctx.dataset.label}: ${v} mΩ`;
+                  if (ctx.dataset.label.includes('ResScale')) return `${ctx.dataset.label}: ${v}`;
                   return `${ctx.dataset.label}: ${v.toLocaleString()}`;
                 }
               }
@@ -2048,6 +2070,40 @@ function PerformanceManagementChart({
                 color: '#f778ba',
                 callback: v => v + 'mA'
               }
+            },
+            'y-rss': {
+              type: 'linear',
+              position: 'right',
+              display: hasRss,
+              title: {
+                display: true,
+                text: 'RSS (mΩ)',
+                color: '#f47067'
+              },
+              grid: {
+                drawOnChartArea: false,
+                drawBorder: false
+              },
+              ticks: {
+                color: '#f47067'
+              }
+            },
+            'y-resscale': {
+              type: 'linear',
+              position: 'right',
+              display: hasResScale,
+              title: {
+                display: true,
+                text: 'ResScale',
+                color: '#e3b341'
+              },
+              grid: {
+                drawOnChartArea: false,
+                drawBorder: false
+              },
+              ticks: {
+                color: '#e3b341'
+              }
             }
           }
         }
@@ -2061,7 +2117,7 @@ function PerformanceManagementChart({
         chartInstance.current = null;
       }
     };
-  }, [filteredCpms, filteredBat, selectedMetrics]);
+  }, [filteredCpms, filteredBat, filteredSbc, selectedMetrics]);
   return /*#__PURE__*/React.createElement("div", {
     style: getChartLayoutStyle(mobile)
   }, /*#__PURE__*/React.createElement("div", {
@@ -2248,16 +2304,17 @@ function PowerBatteryDashboard({
   }, "Battery Health (Long-term)"), /*#__PURE__*/React.createElement("div", {
     className: `tab ${activeTab === 'sbc' ? 'active' : ''}`,
     onClick: () => setActiveTab('sbc')
-  }, "Battery State (Recent)"), hasCpmsData && /*#__PURE__*/React.createElement("div", {
+  }, "Battery State (Recent)"), (hasCpmsData || bdcSbcData.length > 0) && /*#__PURE__*/React.createElement("div", {
     className: `tab ${activeTab === 'perf' ? 'active' : ''}`,
     onClick: () => setActiveTab('perf')
   }, "Performance Mgmt")), activeTab === 'daily' && /*#__PURE__*/React.createElement(BatteryHealthChart, {
     data: bdcDailyData
   }), activeTab === 'sbc' && /*#__PURE__*/React.createElement(BatteryStateChart, {
     data: bdcSbcData
-  }), activeTab === 'perf' && hasCpmsData && /*#__PURE__*/React.createElement(PerformanceManagementChart, {
+  }), activeTab === 'perf' && (hasCpmsData || bdcSbcData.length > 0) && /*#__PURE__*/React.createElement(PerformanceManagementChart, {
     cpmsData: cpmsData,
-    batteryEvents: batteryEvents
+    batteryEvents: batteryEvents,
+    sbcData: bdcSbcData
   }), /*#__PURE__*/React.createElement(CollapsibleFileList, {
     files: sectionFiles,
     selectedFile: selectedFile,

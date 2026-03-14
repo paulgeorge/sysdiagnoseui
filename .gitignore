@@ -1,0 +1,9 @@
+# Everything ignored by default
+*
+
+# Track these files
+!.gitignore
+!index.html
+!index-dev.html
+!build.sh
+!build.js

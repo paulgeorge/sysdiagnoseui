@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0d1117">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>Sysdiagnose Explorer</title>    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -414,6 +417,143 @@
 
         .empty-state p {
             font-size: 14px;
+        }
+
+        /* ===== MOBILE / SAFARI RESPONSIVE ===== */
+
+        /* Safe area for notched iPhones */
+        @supports (padding: env(safe-area-inset-top)) {
+            .container {
+                padding-left: max(24px, env(safe-area-inset-left));
+                padding-right: max(24px, env(safe-area-inset-right));
+                padding-bottom: max(24px, env(safe-area-inset-bottom));
+            }
+        }
+
+        /* Prevent iOS Safari bounce/overscroll */
+        html {
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior: none;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 12px;
+            }
+
+            .header {
+                margin-bottom: 16px;
+            }
+
+            .header h1 {
+                font-size: 22px;
+            }
+
+            .upload-zone {
+                padding: 24px 16px;
+                margin-bottom: 16px;
+            }
+
+            .upload-icon {
+                font-size: 36px;
+            }
+
+            .summary-cards {
+                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                gap: 8px;
+                margin-bottom: 16px;
+            }
+
+            .summary-card {
+                padding: 10px;
+            }
+
+            .summary-card-value {
+                font-size: 18px;
+            }
+
+            .section-header {
+                padding: 10px 12px;
+                min-height: 44px; /* Apple HIG touch target */
+            }
+
+            .section-body {
+                padding: 10px;
+            }
+
+            .chart-container {
+                height: 260px;
+            }
+
+            .tab-bar {
+                gap: 12px;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                scrollbar-width: none;
+                -ms-overflow-style: none;
+            }
+
+            .tab-bar::-webkit-scrollbar {
+                display: none;
+            }
+
+            .tab {
+                white-space: nowrap;
+                flex-shrink: 0;
+            }
+
+            .dashboard-controls {
+                gap: 10px;
+            }
+
+            .button-group {
+                flex-wrap: wrap;
+            }
+
+            .time-button {
+                padding: 6px 14px;
+                font-size: 13px;
+                min-height: 32px;
+            }
+
+            .checkbox-group {
+                min-width: unset;
+            }
+
+            .file-item {
+                padding: 10px 8px;
+                font-size: 12px;
+            }
+
+            .file-item-name {
+                font-size: 11px;
+            }
+
+            .preview-panel {
+                max-height: 300px;
+            }
+
+            .preview-content {
+                font-size: 11px;
+            }
+
+            .section-info {
+                display: none; /* hide file count/size on small screens */
+            }
+        }
+
+        @media (max-width: 480px) {
+            .summary-cards {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .header h1 {
+                font-size: 18px;
+            }
+
+            .chart-container {
+                height: 220px;
+            }
         }
     </style>
 </head>
@@ -950,6 +1090,47 @@ function FilePreview({
 // ===== Shared sidebar styles (matching Unified Log) =====
 const CHART_SIDEBAR_WIDTH = '210px';
 const CHART_TIME_RANGES = ['28D', '7D', '3D', '1D', '12H', '3H'];
+
+function useIsMobile(breakpoint = 768) {
+  const [mobile, setMobile] = useState(window.innerWidth <= breakpoint);
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${breakpoint}px)`);
+    const handler = (e) => setMobile(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, [breakpoint]);
+  return mobile;
+}
+
+function getChartSidebarStyle(mobile) {
+  return mobile ? {
+    width: '100%',
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: '8px',
+    paddingBottom: '8px'
+  } : {
+    width: CHART_SIDEBAR_WIDTH,
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '12px',
+    paddingRight: '12px'
+  };
+}
+
+function getChartLayoutStyle(mobile) {
+  return {
+    display: 'flex',
+    flexDirection: mobile ? 'column' : 'row',
+    gap: 0,
+    minHeight: mobile ? 'auto' : '400px'
+  };
+}
+
+// Keep for backward compat with non-mobile-aware components
 const chartSidebarStyle = {
   width: CHART_SIDEBAR_WIDTH,
   flexShrink: 0,
@@ -1024,6 +1205,7 @@ const chartZoomOptions = {
 function BatteryHealthChart({
   data
 }) {
+  const mobile = useIsMobile();
   const [timeRange, setTimeRange] = useState('all');
   const HEALTH_TIME_RANGES = ['All', '1Y', '6M', '3M', '1M'];
   const HEALTH_METRIC_DEFS = [{
@@ -1191,13 +1373,9 @@ function BatteryHealthChart({
     };
   }, [filteredData, selectedMetrics]);
   return /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 0,
-      minHeight: '420px'
-    }
+    style: getChartLayoutStyle(mobile)
   }, /*#__PURE__*/React.createElement("div", {
-    style: chartSidebarStyle
+    style: getChartSidebarStyle(mobile)
   }, /*#__PURE__*/React.createElement("div", {
     style: chartPanelStyle
   }, /*#__PURE__*/React.createElement("div", {
@@ -1266,6 +1444,7 @@ function BatteryHealthChart({
 function BatteryStateChart({
   data
 }) {
+  const mobile = useIsMobile();
   const [timeRange, setTimeRange] = useState('3d');
   const METRIC_DEFS = [{
     key: 'soc',
@@ -1461,13 +1640,9 @@ function BatteryStateChart({
     };
   }, [filteredData, selectedMetrics]);
   return /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 0,
-      minHeight: '420px'
-    }
+    style: getChartLayoutStyle(mobile)
   }, /*#__PURE__*/React.createElement("div", {
-    style: chartSidebarStyle
+    style: getChartSidebarStyle(mobile)
   }, /*#__PURE__*/React.createElement("div", {
     style: chartPanelStyle
   }, /*#__PURE__*/React.createElement("div", {
@@ -1543,6 +1718,7 @@ function PerformanceManagementChart({
   cpmsData,
   batteryEvents
 }) {
+  const mobile = useIsMobile();
   const [timeRange, setTimeRange] = useState('3d');
   const METRIC_DEFS = [{
     key: 'sysCap0',
@@ -1759,13 +1935,9 @@ function PerformanceManagementChart({
     };
   }, [filteredCpms, filteredBat, selectedMetrics]);
   return /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 0,
-      minHeight: '420px'
-    }
+    style: getChartLayoutStyle(mobile)
   }, /*#__PURE__*/React.createElement("div", {
-    style: chartSidebarStyle
+    style: getChartSidebarStyle(mobile)
   }, /*#__PURE__*/React.createElement("div", {
     style: chartPanelStyle
   }, /*#__PURE__*/React.createElement("div", {
@@ -3323,6 +3495,7 @@ function UnifiedLogDashboard({
   allFiles,
   sectionFiles
 }) {
+  const mobile = useIsMobile();
   const [sbcData, setSbcData] = useState([]);
   const [dailyData, setDailyData] = useState([]);
   const [events, setEvents] = useState([]);
@@ -3644,7 +3817,15 @@ function UnifiedLogDashboard({
     next.has(type) ? next.delete(type) : next.add(type);
     setSelectedEventTypes(next);
   };
-  const sidebarStyle = {
+  const sidebarStyle = mobile ? {
+    width: '100%',
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: '8px',
+    paddingBottom: '8px'
+  } : {
     width: '190px',
     flexShrink: 0,
     display: 'flex',
@@ -3695,8 +3876,9 @@ function UnifiedLogDashboard({
   return /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
+      flexDirection: mobile ? 'column' : 'row',
       gap: 0,
-      minHeight: '480px'
+      minHeight: mobile ? 'auto' : '480px'
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: sidebarStyle

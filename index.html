@@ -712,7 +712,125 @@ class TarParser {
     return file.name.endsWith('.tar.gz') || file.name.endsWith('.tgz');
   }
   static async extract(file, onProgress) {
-    // Phase 1: Stream decompress/read → OPFS temp file (never holds full tar in RAM)
+    // If plain .tar, assume it's a wrapper containing a .tar.gz — find and extract the inner archive
+    if (!TarParser.isGzipped(file)) {
+      return TarParser._extractWrapper(file, onProgress);
+    }
+    return TarParser._extractGz(file, onProgress);
+  }
+  static async _extractWrapper(file, onProgress) {
+    // Scan the plain tar for a nested .tar.gz/.tgz entry, write it to OPFS, then extract that
+    const opfsRoot = await navigator.storage.getDirectory();
+    const decoder = new TextDecoder();
+    const reader = file.stream().getReader();
+    let buffer = new Uint8Array(0);
+    let offset = 0;
+    let found = false;
+    const totalSize = file.size;
+    onProgress(2, 'Scanning wrapper tar...');
+
+    // Read enough to find the first .tar.gz entry header
+    const readMore = async needed => {
+      while (buffer.length - offset < needed) {
+        const {
+          done,
+          value
+        } = await reader.read();
+        if (done) throw new Error('Unexpected end of tar wrapper');
+        const combined = new Uint8Array(buffer.length - offset + value.length);
+        combined.set(buffer.subarray(offset));
+        combined.set(value, buffer.length - offset);
+        buffer = combined;
+        offset = 0;
+      }
+    };
+
+    // Parse tar headers until we find a .tar.gz
+    while (true) {
+      await readMore(512);
+      const header = buffer.subarray(offset, offset + 512);
+      // Check null block
+      let allZero = true;
+      for (let i = 0; i < 512; i++) {
+        if (header[i] !== 0) {
+          allZero = false;
+          break;
+        }
+      }
+      if (allZero) break;
+      const name = decoder.decode(header.subarray(0, 100)).split('\0')[0];
+      const sizeStr = decoder.decode(header.subarray(124, 136)).split('\0')[0].trim();
+      const entrySize = sizeStr ? parseInt(sizeStr, 8) || 0 : 0;
+      const prefix = decoder.decode(header.subarray(345, 500)).split('\0')[0];
+      const fullName = (prefix ? prefix + '/' + name : name).replace(/\0+$/, '');
+      offset += 512;
+      if (fullName.endsWith('.tar.gz') || fullName.endsWith('.tgz')) {
+        // Stream this entry's data to an OPFS file
+        onProgress(5, 'Extracting inner archive...');
+        const innerName = '_sysdiagnose_inner_' + Date.now() + '.tar.gz';
+        const innerHandle = await opfsRoot.getFileHandle(innerName, {
+          create: true
+        });
+        const writable = await innerHandle.createWritable();
+        let remaining = entrySize;
+        // Write whatever we already have buffered
+        const buffered = Math.min(remaining, buffer.length - offset);
+        if (buffered > 0) {
+          await writable.write(buffer.subarray(offset, offset + buffered));
+          remaining -= buffered;
+          offset += buffered;
+        }
+        // Stream the rest directly from the file reader
+        while (remaining > 0) {
+          const {
+            done,
+            value
+          } = await reader.read();
+          if (done) break;
+          const toWrite = value.subarray(0, Math.min(value.length, remaining));
+          await writable.write(toWrite);
+          remaining -= toWrite.length;
+          const pct = 5 + (entrySize - remaining) / entrySize * 40;
+          onProgress(Math.min(45, pct), 'Extracting inner archive...');
+        }
+        await writable.close();
+        // Now extract the inner .tar.gz via OPFS
+        const innerFile = await innerHandle.getFile();
+        const innerBlob = new File([innerFile], fullName.split('/').pop());
+        const result = await TarParser._extractGz(innerBlob, onProgress);
+        try {
+          await opfsRoot.removeEntry(innerName);
+        } catch (_) {}
+        return result;
+      }
+
+      // Skip this entry's data
+      const dataBlocks = Math.ceil(entrySize / 512) * 512;
+      // Discard buffered data for this entry
+      const bufferedData = buffer.length - offset;
+      if (bufferedData >= dataBlocks) {
+        offset += dataBlocks;
+      } else {
+        // Need to read and discard from stream
+        let toSkip = dataBlocks - bufferedData;
+        offset = buffer.length; // consumed all buffer
+        while (toSkip > 0) {
+          const {
+            done,
+            value
+          } = await reader.read();
+          if (done) break;
+          toSkip -= value.length;
+        }
+        buffer = new Uint8Array(0);
+        offset = 0;
+      }
+      onProgress(Math.min(10, offset / totalSize * 10), 'Scanning wrapper tar...');
+    }
+    throw new Error('No .tar.gz sysdiagnose found inside wrapper tar');
+  }
+  static async _extractGz(file, onProgress) {
+    // Stream decompress .tar.gz → OPFS temp file (never holds full tar in RAM)
     const opfsRoot = await navigator.storage.getDirectory();
     const tempName = '_sysdiagnose_temp_' + Date.now() + '.tar';
     const tempHandle = await opfsRoot.getFileHandle(tempName, {
@@ -722,10 +840,7 @@ class TarParser {
     let totalWritten = 0;
     const compressedSize = file.size;
     try {
-      let inputStream = file.stream();
-      if (TarParser.isGzipped(file)) {
-        inputStream = inputStream.pipeThrough(new DecompressionStream('gzip'));
-      }
+      const inputStream = file.stream().pipeThrough(new DecompressionStream('gzip'));
       const reader = inputStream.getReader();
       while (true) {
         const {
@@ -735,8 +850,8 @@ class TarParser {
         if (done) break;
         await writable.write(value);
         totalWritten += value.length;
-        const est = Math.min(48, TarParser.isGzipped(file) ? totalWritten / (compressedSize * 3.5) * 50 : totalWritten / compressedSize * 50);
-        onProgress(est, TarParser.isGzipped(file) ? 'Decompressing to disk...' : 'Reading...');
+        const est = Math.min(48, totalWritten / (compressedSize * 3.5) * 50);
+        onProgress(est, 'Decompressing to disk...');
       }
       await writable.close();
     } catch (e) {
@@ -750,7 +865,7 @@ class TarParser {
     }
     onProgress(50, 'Parsing tar archive...');
 
-    // Phase 2: Parse tar entries by reading slices from the OPFS file (low memory)
+    // Parse tar entries by reading slices from the OPFS file (low memory)
     const tarFile = await tempHandle.getFile();
     const tarSize = tarFile.size;
     const decoder = new TextDecoder();

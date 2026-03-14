@@ -708,24 +708,43 @@ class ErrorBoundary extends Component {
 
 // ===== TAR PARSER (bulk decompress then parse — handles 300MB+ files) =====
 class TarParser {
+  static isGzipped(file) {
+    return file.name.endsWith('.tar.gz') || file.name.endsWith('.tgz');
+  }
   static async extract(file, onProgress) {
-    // Phase 1: Decompress gzip into memory using DecompressionStream
-    const ds = new DecompressionStream('gzip');
-    const decompressedStream = file.stream().pipeThrough(ds);
-    const reader = decompressedStream.getReader();
+    // Phase 1: Read into memory — decompress gzip if needed
     const chunks = [];
     let totalDecompressed = 0;
     const compressedSize = file.size;
-    while (true) {
-      const {
-        done,
-        value
-      } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      totalDecompressed += value.length;
-      const est = Math.min(48, totalDecompressed / (compressedSize * 3.5) * 50);
-      onProgress(est, 'Decompressing...');
+    if (TarParser.isGzipped(file)) {
+      const ds = new DecompressionStream('gzip');
+      const decompressedStream = file.stream().pipeThrough(ds);
+      const reader = decompressedStream.getReader();
+      while (true) {
+        const {
+          done,
+          value
+        } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        totalDecompressed += value.length;
+        const est = Math.min(48, totalDecompressed / (compressedSize * 3.5) * 50);
+        onProgress(est, 'Decompressing...');
+      }
+    } else {
+      // Plain .tar — read directly
+      const reader = file.stream().getReader();
+      while (true) {
+        const {
+          done,
+          value
+        } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        totalDecompressed += value.length;
+        const est = Math.min(48, totalDecompressed / compressedSize * 50);
+        onProgress(est, 'Reading...');
+      }
     }
     onProgress(50, 'Building buffer...');
     // Concatenate into single ArrayBuffer
@@ -4896,12 +4915,12 @@ function SysdiagnoseExplorer() {
         fontSize: '12px',
         color: '#6e7681'
       }
-    }, "Supports .tar.gz files"), /*#__PURE__*/React.createElement("p", {
+    }, "Supports .tar.gz and .tar files"), /*#__PURE__*/React.createElement("p", {
       className: "privacy-note"
     }, "Everything is processed locally \u2014 no data leaves your device")), /*#__PURE__*/React.createElement("input", {
       ref: fileInputRef,
       type: "file",
-      accept: ".tar.gz,.tgz",
+      accept: ".tar.gz,.tgz,.tar",
       onChange: handleFileSelect
     })), /*#__PURE__*/React.createElement("details", {
       style: {
@@ -4943,7 +4962,7 @@ function SysdiagnoseExplorer() {
       style: {
         color: '#e6edf3'
       }
-    }, ".tar.gz"), " file above to begin analysis"))), savedArchives.length > 0 && /*#__PURE__*/React.createElement("div", {
+    }, ".tar.gz / .tar"), " file above to begin analysis"))), savedArchives.length > 0 && /*#__PURE__*/React.createElement("div", {
       style: {
         marginTop: '24px'
       }

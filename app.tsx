@@ -2148,6 +2148,271 @@ function SystemPerformanceDashboard({
 }
 
 // ===== CRASHES & DIAGNOSTICS DASHBOARD =====
+
+// ============================================================================
+// CrashDetailView - Enhanced crash .ips file parser and viewer
+// Supports JSON + header-line fallback, all-threads view, exception codes,
+// coalition info, and plaintext .ips fallback parsing
+// ============================================================================
+function CrashDetailView({ fileData, crashInfo }) {
+  const [detail, setDetail] = useState(null);
+  const [showAllThreads, setShowAllThreads] = useState(false);
+
+  useEffect(() => {
+    if (!fileData) { setDetail(null); return; }
+    try {
+      const decoder = new TextDecoder('utf-8', { fatal: false });
+      const buf = fileData instanceof ArrayBuffer ? new Uint8Array(fileData) : fileData;
+      const text = decoder.decode(buf);
+      const parsed: any = {};
+
+      // Try JSON parse (most IPS files are JSON or have JSON after a header line)
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (_) {
+        // Some .ips files have a header line then JSON
+        const nlIdx = text.indexOf('\n');
+        if (nlIdx > 0) {
+          try { json = JSON.parse(text.substring(nlIdx + 1)); } catch (_2) {}
+        }
+      }
+
+      if (json) {
+        parsed.exception_type = (json.exception && json.exception.type) || '';
+        parsed.exception_subtype = (json.exception && json.exception.subtype) || '';
+        parsed.exception_message = (json.exception && json.exception.message) || '';
+        parsed.exception_codes = (json.exception && json.exception.codes) || '';
+        parsed.termination_reason = (json.termination && json.termination.reason) || '';
+        parsed.termination_namespace = (json.termination && json.termination.namespace) || '';
+        parsed.faulting_thread = json.faultingThread !== undefined ? json.faultingThread : '';
+        parsed.bug_type = json.bug_type || '';
+        parsed.process = json.procName || json.processName || '';
+        parsed.pid = json.pid || '';
+        parsed.os_version = json.osVersion || '';
+        parsed.incident_id = json.incident || '';
+        parsed.hardware_model = json.modelCode || '';
+        parsed.parentProcess = json.parentProc || '';
+        parsed.coalitionName = json.coalitionName || '';
+
+        // Extract all thread stack traces
+        parsed.threads = [];
+        if (json.threads && Array.isArray(json.threads)) {
+          json.threads.forEach((thread, idx) => {
+            parsed.threads.push({
+              index: idx,
+              name: thread.name || ('Thread ' + idx),
+              triggered: thread.triggered || false,
+              isFaulting: idx === json.faultingThread,
+              frames: (thread.frames || []).map(fr => ({
+                imageOffset: fr.imageOffset,
+                imageName: fr.imageName || '',
+                symbol: fr.symbol || '',
+                symbolLocation: fr.symbolLocation || 0,
+                address: fr.address || ''
+              }))
+            });
+          });
+        }
+
+        // Extract faulting thread frames separately for easy access
+        if (json.threads && json.threads[json.faultingThread]) {
+          const thread = json.threads[json.faultingThread];
+          parsed.thread_name = thread.name || ('Thread ' + json.faultingThread);
+          parsed.frames = (thread.frames || []).map(fr => ({
+            imageOffset: fr.imageOffset,
+            imageName: fr.imageName || '',
+            symbol: fr.symbol || '',
+            symbolLocation: fr.symbolLocation || 0,
+            address: fr.address || ''
+          }));
+        } else {
+          parsed.frames = [];
+        }
+      } else {
+        // Fallback: regex parse for non-JSON .ips files
+        parsed.exception_type = '';
+        parsed.termination_reason = '';
+        parsed.process = crashInfo ? crashInfo.process : '';
+        parsed.frames = [];
+        parsed.threads = [];
+
+        // Try to extract crashed thread dump text
+        const threadMatch = text.match(/Thread \d+[^\n]*Crashed[^\n]*:\n([\s\S]{0,5000}?)(?:\nThread \d|\n\n)/);
+        if (threadMatch) {
+          parsed.raw_stack = threadMatch[1];
+        }
+
+        // Try to extract exception info from plaintext
+        const excMatch = text.match(/Exception Type:\s*(.+)/);
+        if (excMatch) parsed.exception_type = excMatch[1].trim();
+        const termMatch = text.match(/Termination Reason:\s*(.+)/);
+        if (termMatch) parsed.termination_reason = termMatch[1].trim();
+        const trigMatch = text.match(/Triggered by Thread:\s*(\d+)/);
+        if (trigMatch) parsed.faulting_thread = parseInt(trigMatch[1], 10);
+      }
+
+      setDetail(parsed);
+    } catch (e) {
+      setDetail({ error: e.message });
+    }
+  }, [fileData, crashInfo]);
+
+  if (!detail) {
+    return <div style={{ textAlign: 'center', padding: '48px 16px', color: '#6e7681', fontSize: '13px' }}>
+      Select a crash report from the list to view details
+    </div>;
+  }
+
+  if (detail.error) {
+    return <div style={{ color: '#f85149', fontSize: '12px' }}>Error parsing crash: {detail.error}</div>;
+  }
+
+  return (
+    <div>
+      {/* Process header */}
+      <div style={{ marginBottom: '12px', fontSize: '14px', fontWeight: 600, color: '#e6edf3' }}>
+        {detail.process || (crashInfo && crashInfo.process)}
+        {detail.pid && <span style={{ fontSize: '12px', color: '#8b949e', marginLeft: '8px' }}>PID {detail.pid}</span>}
+      </div>
+
+      {/* Metadata cards */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', marginBottom: '16px' }}>
+        {detail.exception_type && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>Exception Type</div>
+            <div style={{ fontSize: '13px', color: '#f85149', fontWeight: 600 }}>{detail.exception_type}</div>
+          </div>
+        )}
+        {detail.exception_subtype && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>Exception Subtype</div>
+            <div style={{ fontSize: '13px', color: '#d29922', fontWeight: 600 }}>{detail.exception_subtype}</div>
+          </div>
+        )}
+        {detail.exception_codes && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>Exception Codes</div>
+            <div style={{ fontSize: '13px', color: '#f778ba', fontWeight: 600, fontFamily: 'monospace' }}>{detail.exception_codes}</div>
+          </div>
+        )}
+        {detail.termination_reason && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>Termination Reason</div>
+            <div style={{ fontSize: '13px', color: '#bc8cff', fontWeight: 600 }}>{detail.termination_reason}</div>
+          </div>
+        )}
+        {detail.termination_namespace && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>Namespace</div>
+            <div style={{ fontSize: '13px', color: '#58a6ff', fontWeight: 600 }}>{detail.termination_namespace}</div>
+          </div>
+        )}
+        {detail.faulting_thread !== '' && detail.faulting_thread !== undefined && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>Faulting Thread</div>
+            <div style={{ fontSize: '13px', color: '#3fb950', fontWeight: 600 }}>{detail.faulting_thread}</div>
+          </div>
+        )}
+        {detail.bug_type && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>Bug Type</div>
+            <div style={{ fontSize: '13px', color: '#e6edf3', fontWeight: 600 }}>{BUG_TYPE_MAP[detail.bug_type] || detail.bug_type}</div>
+          </div>
+        )}
+        {detail.os_version && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>OS Version</div>
+            <div style={{ fontSize: '13px', color: '#8b949e', fontWeight: 600 }}>{detail.os_version}</div>
+          </div>
+        )}
+        {detail.coalitionName && (
+          <div style={{ padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }}>
+            <div style={{ fontSize: '10px', color: '#8b949e' }}>Coalition</div>
+            <div style={{ fontSize: '13px', color: '#8b949e', fontWeight: 600 }}>{detail.coalitionName}</div>
+          </div>
+        )}
+      </div>
+
+      {/* Exception message */}
+      {detail.exception_message && (
+        <div style={{ ...chartPanelStyle, marginBottom: '12px' }}>
+          <div style={chartPanelHeaderStyle}><span>Exception Message</span></div>
+          <pre style={{ fontFamily: 'monospace', fontSize: '11px', color: '#f85149', whiteSpace: 'pre-wrap', margin: 0 }}>
+            {detail.exception_message}
+          </pre>
+        </div>
+      )}
+
+      {/* Faulting thread stack trace */}
+      {detail.frames && detail.frames.length > 0 && (
+        <div style={{ ...chartPanelStyle, maxHeight: '400px', overflowY: 'auto', marginBottom: '12px' }}>
+          <div style={chartPanelHeaderStyle}>
+            <span>Stack Trace{detail.thread_name ? ' (' + detail.thread_name + ')' : ''}</span>
+          </div>
+          <div style={{ fontFamily: 'monospace', fontSize: '11px', lineHeight: '1.6' }}>
+            {detail.frames.map((fr, i) => (
+              <div key={i} style={{ display: 'flex', gap: '8px', padding: '2px 0', borderBottom: '1px solid #21262d' }}>
+                <span style={{ color: '#6e7681', minWidth: '24px', textAlign: 'right' }}>{i}</span>
+                <span style={{ color: '#58a6ff', minWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fr.imageName}</span>
+                <span style={{ color: fr.symbol ? '#e6edf3' : '#6e7681', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {fr.symbol ? fr.symbol + ' + ' + fr.symbolLocation : '0x' + (fr.imageOffset || 0).toString(16)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* All threads toggle */}
+      {detail.threads && detail.threads.length > 1 && (
+        <div style={{ marginBottom: '12px' }}>
+          <button
+            className={'time-button ' + (showAllThreads ? 'active' : '')}
+            onClick={() => setShowAllThreads(!showAllThreads)}
+            style={{ fontSize: '11px' }}
+          >
+            {showAllThreads ? 'Hide' : 'Show'} All Threads ({detail.threads.length})
+          </button>
+          {showAllThreads && detail.threads.map((thread, tidx) => (
+            <div key={tidx} style={{ ...chartPanelStyle, marginTop: '8px', maxHeight: '300px', overflowY: 'auto' }}>
+              <div style={chartPanelHeaderStyle}>
+                <span style={{ color: thread.isFaulting ? '#f85149' : '#e6edf3' }}>
+                  {thread.name}{thread.isFaulting ? ' (Crashed)' : ''}
+                </span>
+              </div>
+              <div style={{ fontFamily: 'monospace', fontSize: '11px', lineHeight: '1.6' }}>
+                {thread.frames.slice(0, 20).map((fr, i) => (
+                  <div key={i} style={{ display: 'flex', gap: '8px', padding: '1px 0' }}>
+                    <span style={{ color: '#6e7681', minWidth: '24px', textAlign: 'right' }}>{i}</span>
+                    <span style={{ color: '#58a6ff', minWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fr.imageName}</span>
+                    <span style={{ color: fr.symbol ? '#e6edf3' : '#6e7681', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {fr.symbol ? fr.symbol + ' + ' + fr.symbolLocation : '0x' + (fr.imageOffset || 0).toString(16)}
+                    </span>
+                  </div>
+                ))}
+                {thread.frames.length > 20 && (
+                  <div style={{ color: '#6e7681', fontSize: '11px', padding: '4px 0' }}>... {thread.frames.length - 20} more frames</div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Raw stack trace fallback for non-JSON */}
+      {detail.raw_stack && (
+        <div style={{ ...chartPanelStyle, maxHeight: '350px', overflowY: 'auto' }}>
+          <div style={chartPanelHeaderStyle}><span>Stack Trace (Crashed Thread)</span></div>
+          <pre style={{ fontFamily: 'monospace', fontSize: '11px', color: '#e6edf3', whiteSpace: 'pre-wrap', margin: 0 }}>
+            {detail.raw_stack}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CrashesDashboard({
   files,
   sectionFiles
@@ -2156,7 +2421,6 @@ function CrashesDashboard({
   const [selectedFile, setSelectedFile] = useState(null);
   const [activeTab, setActiveTab] = useState('summary');
   const [selectedCrash, setSelectedCrash] = useState(null);
-  const [crashDetail, setCrashDetail] = useState(null);
   const chartRef = useRef(null);
   const chartInstance = useRef(null);
   useEffect(() => {
@@ -2448,61 +2712,6 @@ function CrashesDashboard({
         key: i,
         onClick: () => {
           setSelectedCrash(c);
-          // Parse the IPS file
-          const file = sectionFiles.find(f => f.name === c.name);
-          if (!file || !file.data) { setCrashDetail(null); return; }
-          try {
-            const decoder = new TextDecoder('utf-8', { fatal: false });
-            const buf = file.data instanceof ArrayBuffer ? new Uint8Array(file.data) : file.data;
-            const text = decoder.decode(buf);
-            const detail = {};
-            // Try JSON parse (most IPS files are JSON)
-            try {
-              const json = JSON.parse(text);
-              detail.exception_type = (json.exception && json.exception.type) || '';
-              detail.exception_subtype = (json.exception && json.exception.subtype) || '';
-              detail.exception_message = (json.exception && json.exception.message) || '';
-              detail.termination_reason = (json.termination && json.termination.reason) || '';
-              detail.termination_namespace = (json.termination && json.termination.namespace) || '';
-              detail.faulting_thread = json.faultingThread !== undefined ? json.faultingThread : '';
-              detail.bug_type = json.bug_type || '';
-              // Extract stack trace from faulting thread
-              if (json.threads && json.threads[json.faultingThread]) {
-                const thread = json.threads[json.faultingThread];
-                detail.thread_name = thread.name || ('Thread ' + json.faultingThread);
-                detail.frames = (thread.frames || []).map(fr => ({
-                  imageOffset: fr.imageOffset,
-                  imageName: fr.imageName || '',
-                  symbol: fr.symbol || '',
-                  symbolLocation: fr.symbolLocation || 0,
-                  address: fr.address || ''
-                }));
-              } else {
-                detail.frames = [];
-              }
-              detail.process = json.procName || json.processName || c.process;
-              detail.pid = json.pid || '';
-              detail.os_version = json.osVersion || '';
-            } catch (_) {
-              // Fallback: regex parse for non-JSON .ips
-              const grab = key => {
-                const m = text.match(new RegExp('"' + key + '"\\s*:\\s*"([^"]+)"'));
-                return m ? m[1] : '';
-              };
-              detail.exception_type = grab('type');
-              detail.termination_reason = grab('reason');
-              detail.process = c.process;
-              detail.frames = [];
-              // Try to extract thread dump text
-              const threadMatch = text.match(/Thread \d+[^\n]*Crashed[^\n]*:\n([\s\S]{0,3000}?)(?:\nThread \d|\n\n)/);
-              if (threadMatch) {
-                detail.raw_stack = threadMatch[1];
-              }
-            }
-            setCrashDetail(detail);
-          } catch (e) {
-            setCrashDetail({ error: e.message });
-          }
         },
         style: {
           padding: '6px 10px',
@@ -2518,68 +2727,10 @@ function CrashesDashboard({
       ))),
       /*#__PURE__*/React.createElement("div", {
         style: { flex: 1, minWidth: 0 }
-      }, crashDetail ? /*#__PURE__*/React.createElement("div", null,
-        /*#__PURE__*/React.createElement("div", {
-          style: { marginBottom: '12px', fontSize: '14px', fontWeight: 600, color: '#e6edf3' }
-        }, crashDetail.process || (selectedCrash && selectedCrash.process)),
-        /*#__PURE__*/React.createElement("div", {
-          style: { display: 'flex', flexWrap: 'wrap', gap: '10px', marginBottom: '16px' }
-        },
-          crashDetail.exception_type && /*#__PURE__*/React.createElement("div", {
-            style: { padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }
-          }, /*#__PURE__*/React.createElement("div", { style: { fontSize: '10px', color: '#8b949e' } }, "Exception Type"),
-            /*#__PURE__*/React.createElement("div", { style: { fontSize: '13px', color: '#f85149', fontWeight: 600 } }, crashDetail.exception_type)),
-          crashDetail.exception_subtype && /*#__PURE__*/React.createElement("div", {
-            style: { padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }
-          }, /*#__PURE__*/React.createElement("div", { style: { fontSize: '10px', color: '#8b949e' } }, "Exception Subtype"),
-            /*#__PURE__*/React.createElement("div", { style: { fontSize: '13px', color: '#d29922', fontWeight: 600 } }, crashDetail.exception_subtype)),
-          crashDetail.termination_reason && /*#__PURE__*/React.createElement("div", {
-            style: { padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }
-          }, /*#__PURE__*/React.createElement("div", { style: { fontSize: '10px', color: '#8b949e' } }, "Termination Reason"),
-            /*#__PURE__*/React.createElement("div", { style: { fontSize: '13px', color: '#bc8cff', fontWeight: 600 } }, crashDetail.termination_reason)),
-          crashDetail.termination_namespace && /*#__PURE__*/React.createElement("div", {
-            style: { padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }
-          }, /*#__PURE__*/React.createElement("div", { style: { fontSize: '10px', color: '#8b949e' } }, "Namespace"),
-            /*#__PURE__*/React.createElement("div", { style: { fontSize: '13px', color: '#58a6ff', fontWeight: 600 } }, crashDetail.termination_namespace)),
-          crashDetail.faulting_thread !== '' && /*#__PURE__*/React.createElement("div", {
-            style: { padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }
-          }, /*#__PURE__*/React.createElement("div", { style: { fontSize: '10px', color: '#8b949e' } }, "Faulting Thread"),
-            /*#__PURE__*/React.createElement("div", { style: { fontSize: '13px', color: '#3fb950', fontWeight: 600 } }, crashDetail.faulting_thread)),
-          crashDetail.bug_type && /*#__PURE__*/React.createElement("div", {
-            style: { padding: '6px 12px', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '8px' }
-          }, /*#__PURE__*/React.createElement("div", { style: { fontSize: '10px', color: '#8b949e' } }, "Bug Type"),
-            /*#__PURE__*/React.createElement("div", { style: { fontSize: '13px', color: '#e6edf3', fontWeight: 600 } }, BUG_TYPE_MAP[crashDetail.bug_type] || crashDetail.bug_type))
-        ),
-        crashDetail.frames && crashDetail.frames.length > 0 && /*#__PURE__*/React.createElement("div", {
-          style: { ...chartPanelStyle, maxHeight: '350px', overflowY: 'auto' }
-        },
-          /*#__PURE__*/React.createElement("div", { style: chartPanelHeaderStyle }, /*#__PURE__*/React.createElement("span", null, "Stack Trace", crashDetail.thread_name ? ' (' + crashDetail.thread_name + ')' : '')),
-          /*#__PURE__*/React.createElement("div", {
-            style: { fontFamily: 'monospace', fontSize: '11px', lineHeight: '1.6' }
-          }, crashDetail.frames.map((fr, i) => /*#__PURE__*/React.createElement("div", {
-            key: i,
-            style: { display: 'flex', gap: '8px', padding: '2px 0', borderBottom: '1px solid #21262d' }
-          },
-            /*#__PURE__*/React.createElement("span", { style: { color: '#6e7681', minWidth: '24px', textAlign: 'right' } }, i),
-            /*#__PURE__*/React.createElement("span", { style: { color: '#58a6ff', minWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, fr.imageName),
-            /*#__PURE__*/React.createElement("span", { style: { color: fr.symbol ? '#e6edf3' : '#6e7681', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-              fr.symbol ? fr.symbol + ' + ' + fr.symbolLocation : '0x' + (fr.imageOffset || 0).toString(16))
-          )))
-        ),
-        crashDetail.raw_stack && /*#__PURE__*/React.createElement("div", {
-          style: { ...chartPanelStyle, maxHeight: '350px', overflowY: 'auto' }
-        },
-          /*#__PURE__*/React.createElement("div", { style: chartPanelHeaderStyle }, /*#__PURE__*/React.createElement("span", null, "Stack Trace (Crashed Thread)")),
-          /*#__PURE__*/React.createElement("pre", {
-            style: { fontFamily: 'monospace', fontSize: '11px', color: '#e6edf3', whiteSpace: 'pre-wrap', margin: 0 }
-          }, crashDetail.raw_stack)
-        ),
-        crashDetail.error && /*#__PURE__*/React.createElement("div", {
-          style: { color: '#f85149', fontSize: '12px' }
-        }, "Error parsing crash: ", crashDetail.error)
-      ) : /*#__PURE__*/React.createElement("div", {
-        style: { textAlign: 'center', padding: '48px 16px', color: '#6e7681', fontSize: '13px' }
-      }, "Select a crash report from the list to view details"))
+      }, /*#__PURE__*/React.createElement(CrashDetailView, {
+        fileData: selectedCrash ? (sectionFiles.find(f => f.name === selectedCrash.name) || {}).data : null,
+        crashInfo: selectedCrash
+      }))
     )
   ),
   /*#__PURE__*/React.createElement(CollapsibleFileList, {

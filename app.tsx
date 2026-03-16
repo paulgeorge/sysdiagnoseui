@@ -265,14 +265,35 @@ class TarParser {
 
     onProgress(50, 'Parsing tar archive...');
 
-    // Parse tar entries by reading slices from the OPFS file (low memory)
+    // Parse tar entries using chunked buffered reads (avoids excessive file.slice calls)
     const tarFile = await tempHandle.getFile();
     const tarSize = tarFile.size;
     const decoder = new TextDecoder();
 
-    const readSlice = async (offset, length) => {
-      const blob = tarFile.slice(offset, offset + length);
-      return new Uint8Array(await blob.arrayBuffer());
+    // Buffered reader: reads large chunks to minimize file resource calls
+    const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks
+    let chunkBuf = null;
+    let chunkStart = -1; // file offset where chunkBuf starts
+    let chunkLen = 0;
+
+    const ensureBuffered = async (fileOffset, needed) => {
+      // If the requested range is within our current buffer, no-op
+      if (chunkBuf && fileOffset >= chunkStart && fileOffset + needed <= chunkStart + chunkLen) {
+        return;
+      }
+      // Read a new chunk from the file
+      const readSize = Math.max(CHUNK_SIZE, needed);
+      const end = Math.min(fileOffset + readSize, tarSize);
+      const blob = tarFile.slice(fileOffset, end);
+      chunkBuf = new Uint8Array(await blob.arrayBuffer());
+      chunkStart = fileOffset;
+      chunkLen = chunkBuf.length;
+    };
+
+    const readBytes = async (fileOffset, length) => {
+      await ensureBuffered(fileOffset, length);
+      const localOffset = fileOffset - chunkStart;
+      return chunkBuf.subarray(localOffset, localOffset + length);
     };
 
     const readStr = (buf, start, len) => {
@@ -296,12 +317,12 @@ class TarParser {
     let entryCount = 0;
 
     while (offset < tarSize - 512) {
-      const headerBuf = await readSlice(offset, 512);
+      const headerBuf = await readBytes(offset, 512);
 
       if (isNullBlock(headerBuf)) {
         offset += 512;
         if (offset < tarSize - 512) {
-          const nextBuf = await readSlice(offset, 512);
+          const nextBuf = await readBytes(offset, 512);
           if (isNullBlock(nextBuf)) break; // double null = end of archive
         } else break;
         continue;
@@ -329,9 +350,12 @@ class TarParser {
         const isPLSQL = fullName.endsWith('.PLSQL') || fullName.endsWith('.EPSQL');
         const maxSize = isPLSQL ? 200 * 1024 * 1024 : 2 * 1024 * 1024;
         if (isFileEntry && !isDir && size > 0 && size < maxSize) {
-          // Read only this file's data from disk — not the whole tar
-          const fileData = await readSlice(offset, size);
-          entry.data = isPLSQL ? fileData : fileData.buffer.slice(fileData.byteOffset, fileData.byteOffset + fileData.byteLength);
+          // Read file data from buffered chunks — no extra file.slice per entry
+          const fileData = await readBytes(offset, size);
+          // Must copy since readBytes returns a subarray of the shared chunk buffer
+          const copied = new Uint8Array(size);
+          copied.set(fileData);
+          entry.data = isPLSQL ? copied : copied.buffer.slice(copied.byteOffset, copied.byteOffset + copied.byteLength);
           entry.isPLSQL = isPLSQL;
         }
         entries.push(entry);

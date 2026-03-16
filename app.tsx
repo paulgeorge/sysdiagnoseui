@@ -1,587 +1,3 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <meta name="theme-color" content="#0d1117">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>Sysdiagnose Explorer</title>
-    <link rel="preconnect" href="https://unpkg.com" crossorigin>
-    <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
-    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-            background-color: #0d1117;
-            color: #e6edf3;
-            line-height: 1.5;
-        }
-        
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 24px;
-        }
-        
-        .header {
-            margin-bottom: 32px;
-        }
-        
-        .header h1 {
-            font-size: 28px;
-            font-weight: 600;
-            margin-bottom: 8px;
-        }
-        
-        .header p {
-            color: #8b949e;
-            font-size: 14px;
-        }
-        
-        .upload-zone {
-            border: 2px dashed #30363d;
-            border-radius: 12px;
-            padding: 48px 24px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.2s;
-            margin-bottom: 32px;
-        }
-        
-        .upload-zone:hover {
-            border-color: #58a6ff;
-            background-color: rgba(88, 166, 255, 0.1);
-        }
-        
-        .upload-zone.dragover {
-            border-color: #58a6ff;
-            background-color: rgba(88, 166, 255, 0.2);
-        }
-        
-        .upload-zone-content {
-            pointer-events: none;
-        }
-        
-        .upload-icon {
-            font-size: 48px;
-            margin-bottom: 16px;
-        }
-        
-        .upload-zone h2 {
-            font-size: 18px;
-            margin-bottom: 8px;
-        }
-        
-        .upload-zone p {
-            color: #8b949e;
-            font-size: 14px;
-            margin-bottom: 12px;
-        }
-        
-        .upload-zone .privacy-note {
-            font-size: 12px;
-            color: #6e7681;
-            margin-top: 16px;
-            font-style: italic;
-        }
-        
-        input[type="file"] {
-            display: none;
-        }
-        
-        .progress-container {
-            margin-bottom: 24px;
-        }
-        
-        .progress-label {
-            font-size: 14px;
-            margin-bottom: 8px;
-            color: #8b949e;
-        }
-        
-        .progress-bar {
-            width: 100%;
-            height: 8px;
-            background-color: #161b22;
-            border-radius: 4px;
-            overflow: hidden;
-            border: 1px solid #30363d;
-        }
-        
-        .progress-fill {
-            height: 100%;
-            background-color: #58a6ff;
-            transition: width 0.3s ease;
-        }
-        
-        .summary-cards {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 16px;
-            margin-bottom: 32px;
-        }
-        
-        .summary-card {
-            background-color: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            padding: 16px;
-        }
-        
-        .summary-card-label {
-            font-size: 12px;
-            color: #8b949e;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 8px;
-        }
-        
-        .summary-card-value {
-            font-size: 24px;
-            font-weight: 600;
-        }
-        
-        .sections-container {
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-        
-        .section {
-            background-color: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            overflow: hidden;
-            transition: all 0.2s;
-        }
-        
-        .section.expanded {
-            border-bottom-left-radius: 0;
-            border-bottom-right-radius: 0;
-        }
-        
-        .section-header {
-            display: flex;
-            align-items: center;
-            min-height: 48px;
-            padding: 8px 16px;
-            background-color: #161b22;
-            border-bottom: 1px solid #30363d;
-            cursor: pointer;
-            user-select: none;
-            transition: all 0.2s;
-            gap: 10px;
-        }
-        
-        .section-header:hover {
-            border-color: #58a6ff;
-        }
-        
-        .section.expanded .section-header {
-            border-bottom-color: #30363d;
-        }
-        
-        .section-icon {
-            font-size: 18px;
-            flex-shrink: 0;
-        }
-        
-        .section-title {
-            font-weight: 600;
-            flex-grow: 1;
-        }
-        
-        .section-info {
-            display: flex;
-            gap: 16px;
-            font-size: 12px;
-            color: #8b949e;
-            flex-shrink: 0;
-        }
-        
-        .section-chevron {
-            font-size: 18px;
-            transition: transform 0.2s;
-            flex-shrink: 0;
-        }
-        
-        .section.expanded .section-chevron {
-            transform: rotate(90deg);
-        }
-        
-        .section-body {
-            background-color: #161b22;
-            border-left: 1px solid #30363d;
-            border-right: 1px solid #30363d;
-            border-bottom: 1px solid #30363d;
-            border-bottom-left-radius: 8px;
-            border-bottom-right-radius: 8px;
-            padding: 16px;
-        }
-        
-        .dashboard-container {
-            margin-bottom: 24px;
-        }
-        
-        .tab-bar {
-            display: flex;
-            gap: 24px;
-            border-bottom: 1px solid #30363d;
-            margin-bottom: 16px;
-        }
-        
-        .tab {
-            padding: 8px 0;
-            cursor: pointer;
-            font-size: 14px;
-            color: #8b949e;
-            border-bottom: 2px solid transparent;
-            transition: all 0.2s;
-        }
-        
-        .tab.active {
-            color: #58a6ff;
-            border-bottom-color: #58a6ff;
-        }
-        
-        .dashboard-controls {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 16px;
-            margin-bottom: 16px;
-            align-items: flex-start;
-        }
-        
-        .control-group {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-        
-        .control-label {
-            font-size: 12px;
-            color: #8b949e;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        
-        .button-group {
-            display: flex;
-            gap: 6px;
-        }
-        
-        .time-button {
-            padding: 4px 12px;
-            border: 1px solid #30363d;
-            border-radius: 16px;
-            background-color: #0d1117;
-            color: #8b949e;
-            cursor: pointer;
-            font-size: 12px;
-            transition: all 0.2s;
-        }
-        
-        .time-button:hover {
-            border-color: #58a6ff;
-        }
-        
-        .time-button.active {
-            background-color: #58a6ff;
-            color: #0d1117;
-            border-color: #58a6ff;
-        }
-        
-        .checkbox-group {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            flex: 1;
-            min-width: 200px;
-        }
-        
-        .checkbox-item {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 12px;
-            cursor: pointer;
-        }
-        
-        .checkbox-item input[type="checkbox"] {
-            cursor: pointer;
-            width: 16px;
-            height: 16px;
-        }
-        
-        .color-swatch {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            flex-shrink: 0;
-        }
-        
-        .chart-container {
-            position: relative;
-            height: 400px;
-            margin-bottom: 16px;
-        }
-        
-        .file-list {
-            margin-top: 16px;
-        }
-        
-        .file-item {
-            padding: 8px;
-            border: 1px solid transparent;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: all 0.2s;
-            font-size: 13px;
-            font-family: 'Courier New', monospace;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .file-item:hover {
-            background-color: #0d1117;
-            border-color: #30363d;
-        }
-        
-        .file-item-name {
-            flex-grow: 1;
-            word-break: break-all;
-            color: #58a6ff;
-        }
-        
-        .file-item-size {
-            color: #8b949e;
-            margin-left: 16px;
-            flex-shrink: 0;
-            font-size: 12px;
-        }
-        
-        .preview-panel {
-            margin-top: 16px;
-            border: 1px solid #30363d;
-            border-radius: 4px;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-            max-height: 400px;
-        }
-        
-        .preview-header {
-            padding: 8px 12px;
-            background-color: #0d1117;
-            border-bottom: 1px solid #30363d;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 12px;
-            color: #8b949e;
-        }
-        
-        .preview-close {
-            cursor: pointer;
-            color: #8b949e;
-        }
-        
-        .preview-content {
-            flex-grow: 1;
-            overflow-y: auto;
-            padding: 12px;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-            color: #8b949e;
-        }
-        
-        .empty-state {
-            text-align: center;
-            padding: 32px 16px;
-            color: #6e7681;
-        }
-        
-        .empty-state p {
-            font-size: 14px;
-        }
-        
-        /* ===== MOBILE / SAFARI RESPONSIVE ===== */
-        
-        /* Safe area for notched iPhones */
-        @supports (padding: env(safe-area-inset-top)) {
-            .container {
-                padding-left: max(24px, env(safe-area-inset-left));
-                padding-right: max(24px, env(safe-area-inset-right));
-                padding-bottom: max(24px, env(safe-area-inset-bottom));
-            }
-        }
-        
-        /* Prevent iOS Safari bounce/overscroll */
-        html {
-            -webkit-overflow-scrolling: touch;
-            overscroll-behavior: none;
-        }
-        
-        @media (max-width: 768px) {
-            .container {
-                padding: 12px;
-            }
-        
-            .header {
-                margin-bottom: 16px;
-            }
-        
-            .header h1 {
-                font-size: 22px;
-            }
-        
-            .upload-zone {
-                padding: 24px 16px;
-                margin-bottom: 16px;
-            }
-        
-            .upload-icon {
-                font-size: 36px;
-            }
-        
-            .summary-cards {
-                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-                gap: 8px;
-                margin-bottom: 16px;
-            }
-        
-            .summary-card {
-                padding: 10px;
-            }
-        
-            .summary-card-value {
-                font-size: 18px;
-            }
-        
-            .section-header {
-                padding: 10px 12px;
-                min-height: 44px; /* Apple HIG touch target */
-            }
-        
-            .section-body {
-                padding: 10px;
-            }
-        
-            .chart-container {
-                height: 260px;
-            }
-        
-            .tab-bar {
-                gap: 12px;
-                overflow-x: auto;
-                -webkit-overflow-scrolling: touch;
-                scrollbar-width: none;
-                -ms-overflow-style: none;
-            }
-        
-            .tab-bar::-webkit-scrollbar {
-                display: none;
-            }
-        
-            .tab {
-                white-space: nowrap;
-                flex-shrink: 0;
-            }
-        
-            .dashboard-controls {
-                gap: 10px;
-            }
-        
-            .button-group {
-                flex-wrap: wrap;
-            }
-        
-            .time-button {
-                padding: 6px 14px;
-                font-size: 13px;
-                min-height: 32px;
-            }
-        
-            .checkbox-group {
-                min-width: unset;
-            }
-        
-            .file-item {
-                padding: 10px 8px;
-                font-size: 12px;
-            }
-        
-            .file-item-name {
-                font-size: 11px;
-            }
-        
-            .preview-panel {
-                max-height: 300px;
-            }
-        
-            .preview-content {
-                font-size: 11px;
-            }
-        
-            .section-info {
-                display: none; /* hide file count/size on small screens */
-            }
-        }
-        
-        @media (max-width: 480px) {
-            .summary-cards {
-                grid-template-columns: 1fr 1fr;
-            }
-        
-            .header h1 {
-                font-size: 18px;
-            }
-        
-            .chart-container {
-                height: 220px;
-            }
-        }
-        
-    </style>
-</head>
-<body>
-    <div id="root">
-        <div style="padding:32px;color:#8b949e;font-family:sans-serif;text-align:center;">Loading...</div>
-    </div>
-
-    <!-- Pre-Babel error catcher: shows errors that would otherwise cause a silent black page -->
-    <script>
-        window.onerror = function(msg, url, line, col, error) {
-            var root = document.getElementById('root');
-            if (root) {
-                root.innerHTML = '<div style="padding:32px;color:#f85149;font-family:monospace;background:#161b22;border:1px solid #f85149;border-radius:8px;margin:24px;white-space:pre-wrap;">'
-                    + '<h3 style="margin-bottom:8px;">Script Error</h3>'
-                    + '<p>' + msg + '</p>'
-                    + '<p style="color:#8b949e;font-size:12px;">Line ' + line + ', Col ' + col + '</p>'
-                    + '<p style="color:#8b949e;font-size:12px;">' + (error && error.stack ? error.stack : '') + '</p>'
-                    + '</div>';
-            }
-        };
-    </script>
-
-    <script>
 const {
   useState,
   useRef,
@@ -713,6 +129,7 @@ class TarParser {
   static isGzipped(file) {
     return file.name.endsWith('.tar.gz') || file.name.endsWith('.tgz');
   }
+
   static async extract(file, onProgress) {
     // If plain .tar, assume it's a wrapper containing a .tar.gz — find and extract the inner archive
     if (!TarParser.isGzipped(file)) {
@@ -720,6 +137,7 @@ class TarParser {
     }
     return TarParser._extractGz(file, onProgress);
   }
+
   static async _extractWrapper(file, onProgress) {
     // Scan the plain tar for a nested .tar.gz/.tgz entry, write it to OPFS, then extract that
     const opfsRoot = await navigator.storage.getDirectory();
@@ -729,15 +147,13 @@ class TarParser {
     let offset = 0;
     let found = false;
     const totalSize = file.size;
+
     onProgress(2, 'Scanning wrapper tar...');
 
     // Read enough to find the first .tar.gz entry header
-    const readMore = async needed => {
+    const readMore = async (needed) => {
       while (buffer.length - offset < needed) {
-        const {
-          done,
-          value
-        } = await reader.read();
+        const { done, value } = await reader.read();
         if (done) throw new Error('Unexpected end of tar wrapper');
         const combined = new Uint8Array(buffer.length - offset + value.length);
         combined.set(buffer.subarray(offset));
@@ -753,26 +169,21 @@ class TarParser {
       const header = buffer.subarray(offset, offset + 512);
       // Check null block
       let allZero = true;
-      for (let i = 0; i < 512; i++) {
-        if (header[i] !== 0) {
-          allZero = false;
-          break;
-        }
-      }
+      for (let i = 0; i < 512; i++) { if (header[i] !== 0) { allZero = false; break; } }
       if (allZero) break;
+
       const name = decoder.decode(header.subarray(0, 100)).split('\0')[0];
       const sizeStr = decoder.decode(header.subarray(124, 136)).split('\0')[0].trim();
       const entrySize = sizeStr ? parseInt(sizeStr, 8) || 0 : 0;
       const prefix = decoder.decode(header.subarray(345, 500)).split('\0')[0];
       const fullName = (prefix ? prefix + '/' + name : name).replace(/\0+$/, '');
       offset += 512;
+
       if (fullName.endsWith('.tar.gz') || fullName.endsWith('.tgz')) {
         // Stream this entry's data to an OPFS file
         onProgress(5, 'Extracting inner archive...');
         const innerName = '_sysdiagnose_inner_' + Date.now() + '.tar.gz';
-        const innerHandle = await opfsRoot.getFileHandle(innerName, {
-          create: true
-        });
+        const innerHandle = await opfsRoot.getFileHandle(innerName, { create: true });
         const writable = await innerHandle.createWritable();
         let remaining = entrySize;
         // Write whatever we already have buffered
@@ -784,15 +195,12 @@ class TarParser {
         }
         // Stream the rest directly from the file reader
         while (remaining > 0) {
-          const {
-            done,
-            value
-          } = await reader.read();
+          const { done, value } = await reader.read();
           if (done) break;
           const toWrite = value.subarray(0, Math.min(value.length, remaining));
           await writable.write(toWrite);
           remaining -= toWrite.length;
-          const pct = 5 + (entrySize - remaining) / entrySize * 40;
+          const pct = 5 + ((entrySize - remaining) / entrySize) * 40;
           onProgress(Math.min(45, pct), 'Extracting inner archive...');
         }
         await writable.close();
@@ -800,9 +208,7 @@ class TarParser {
         const innerFile = await innerHandle.getFile();
         const innerBlob = new File([innerFile], fullName.split('/').pop());
         const result = await TarParser._extractGz(innerBlob, onProgress);
-        try {
-          await opfsRoot.removeEntry(innerName);
-        } catch (_) {}
+        try { await opfsRoot.removeEntry(innerName); } catch (_) {}
         return result;
       }
 
@@ -817,38 +223,33 @@ class TarParser {
         let toSkip = dataBlocks - bufferedData;
         offset = buffer.length; // consumed all buffer
         while (toSkip > 0) {
-          const {
-            done,
-            value
-          } = await reader.read();
+          const { done, value } = await reader.read();
           if (done) break;
           toSkip -= value.length;
         }
         buffer = new Uint8Array(0);
         offset = 0;
       }
-      onProgress(Math.min(10, offset / totalSize * 10), 'Scanning wrapper tar...');
+      onProgress(Math.min(10, (offset / totalSize) * 10), 'Scanning wrapper tar...');
     }
+
     throw new Error('No .tar.gz sysdiagnose found inside wrapper tar');
   }
+
   static async _extractGz(file, onProgress) {
     // Stream decompress .tar.gz → OPFS temp file (never holds full tar in RAM)
     const opfsRoot = await navigator.storage.getDirectory();
     const tempName = '_sysdiagnose_temp_' + Date.now() + '.tar';
-    const tempHandle = await opfsRoot.getFileHandle(tempName, {
-      create: true
-    });
+    const tempHandle = await opfsRoot.getFileHandle(tempName, { create: true });
     const writable = await tempHandle.createWritable();
     let totalWritten = 0;
     const compressedSize = file.size;
+
     try {
       const inputStream = file.stream().pipeThrough(new DecompressionStream('gzip'));
       const reader = inputStream.getReader();
       while (true) {
-        const {
-          done,
-          value
-        } = await reader.read();
+        const { done, value } = await reader.read();
         if (done) break;
         await writable.write(value);
         totalWritten += value.length;
@@ -857,42 +258,46 @@ class TarParser {
       }
       await writable.close();
     } catch (e) {
-      try {
-        await writable.close();
-      } catch (_) {}
-      try {
-        await opfsRoot.removeEntry(tempName);
-      } catch (_) {}
+      try { await writable.close(); } catch (_) {}
+      try { await opfsRoot.removeEntry(tempName); } catch (_) {}
       throw e;
     }
+
     onProgress(50, 'Parsing tar archive...');
 
     // Parse tar entries by reading slices from the OPFS file (low memory)
     const tarFile = await tempHandle.getFile();
     const tarSize = tarFile.size;
     const decoder = new TextDecoder();
+
     const readSlice = async (offset, length) => {
       const blob = tarFile.slice(offset, offset + length);
       return new Uint8Array(await blob.arrayBuffer());
     };
+
     const readStr = (buf, start, len) => {
       return decoder.decode(buf.slice(start, start + len)).split('\0')[0];
     };
+
     const readOctal = (buf, start, len) => {
       const s = readStr(buf, start, len).trim();
       return s ? parseInt(s, 8) || 0 : 0;
     };
-    const isNullBlock = buf => {
+
+    const isNullBlock = (buf) => {
       for (let i = 0; i < 512; i++) {
         if (buf[i] !== 0) return false;
       }
       return true;
     };
+
     const entries = [];
     let offset = 0;
     let entryCount = 0;
+
     while (offset < tarSize - 512) {
       const headerBuf = await readSlice(offset, 512);
+
       if (isNullBlock(headerBuf)) {
         offset += 512;
         if (offset < tarSize - 512) {
@@ -901,6 +306,7 @@ class TarParser {
         } else break;
         continue;
       }
+
       const name = readStr(headerBuf, 0, 100);
       const size = readOctal(headerBuf, 124, 12);
       const typeFlag = readStr(headerBuf, 156, 1);
@@ -908,7 +314,7 @@ class TarParser {
       const fullName = (prefix ? prefix + '/' + name : name).replace(/\0+$/, '');
       offset += 512; // past header
 
-      const isFileEntry = typeFlag === '0' || typeFlag === '' || !typeFlag && size > 0;
+      const isFileEntry = typeFlag === '0' || typeFlag === '' || (!typeFlag && size > 0);
       const isDir = typeFlag === '5' || fullName.endsWith('/');
       const baseName = fullName.split('/').pop() || '';
 
@@ -936,16 +342,15 @@ class TarParser {
       const dataBlocks = Math.ceil(size / 512);
       offset += dataBlocks * 512;
       if (entryCount % 200 === 0) {
-        const pct = 52 + offset / tarSize * 48;
+        const pct = 52 + (offset / tarSize) * 48;
         onProgress(Math.min(99, pct), `Parsing entries... (${entryCount} found)`);
         await new Promise(r => setTimeout(r, 0)); // yield to UI
       }
     }
 
     // Clean up OPFS temp file
-    try {
-      await opfsRoot.removeEntry(tempName);
-    } catch (_) {}
+    try { await opfsRoot.removeEntry(tempName); } catch (_) {}
+
     onProgress(100, 'Complete');
     return entries;
   }
@@ -1223,16 +628,18 @@ function FilePreview({
 // ===== Shared sidebar styles (matching Unified Log) =====
 const CHART_SIDEBAR_WIDTH = '210px';
 const CHART_TIME_RANGES = ['28D', '7D', '3D', '1D', '12H', '3H'];
+
 function useIsMobile(breakpoint = 768) {
   const [mobile, setMobile] = useState(window.innerWidth <= breakpoint);
   useEffect(() => {
     const mq = window.matchMedia(`(max-width: ${breakpoint}px)`);
-    const handler = e => setMobile(e.matches);
+    const handler = (e) => setMobile(e.matches);
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);
   }, [breakpoint]);
   return mobile;
 }
+
 function getChartSidebarStyle(mobile) {
   return mobile ? {
     width: '100%',
@@ -1251,6 +658,7 @@ function getChartSidebarStyle(mobile) {
     paddingRight: '12px'
   };
 }
+
 function getChartLayoutStyle(mobile) {
   return {
     display: 'flex',
@@ -1936,7 +1344,7 @@ function PerformanceManagementChart({
       chartInstance.current.destroy();
       chartInstance.current = null;
     }
-    if (!chartRef.current || filteredCpms.length === 0 && filteredSbc.length === 0 && filteredBat.length === 0) return;
+    if (!chartRef.current || (filteredCpms.length === 0 && filteredSbc.length === 0 && filteredBat.length === 0)) return;
     try {
       const datasets = [];
       const activeMetrics = METRIC_DEFS.filter(m => selectedMetrics.has(m.key) && hasData(m));
@@ -5391,6 +4799,3 @@ try {
     rootEl.innerHTML = '<div style="padding:32px;color:#f85149;font-family:monospace;background:#161b22;border:1px solid #f85149;border-radius:8px;margin:24px;">' + '<h3>Render Error</h3><pre style="margin-top:8px;color:#8b949e;white-space:pre-wrap;">' + renderErr.message + '\n' + (renderErr.stack || '') + '</pre></div>';
   }
 }
-    </script>
-</body>
-</html>

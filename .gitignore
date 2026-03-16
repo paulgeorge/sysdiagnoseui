@@ -1,11 +1,15 @@
-# Everything ignored by default
-*
-
-# Track these files
-!.gitignore
-!.github/
-!.github/**
-!index.html
-!index-dev.html
-!build.sh
-!build.js
+# Ignore sysdiagnose data and build artifacts
+sysdiagnose_*/
+Debs-*/
+build_deps/
+node_modules/
+FINDINGS.md
+FINDINGS2.md
+groundtruth.md
+freezer_test_sbc_extract.md
+*.tar
+*.tar.gz
+.superpowers/
+.serena/
+.claude/
+docs/

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build script: compiles JSX in index-dev.html → index.html (production)
+// Build script: inlines app.css + compiles app.jsx → single-file index.html (production)
 // Usage: node build.js
 // Requires: npm install @babel/core @babel/preset-react (in build_deps/)
 
@@ -7,14 +7,18 @@ const fs = require('fs');
 const path = require('path');
 
 const DEV_FILE = 'index-dev.html';
+const CSS_FILE = 'app.css';
+const JSX_FILE = 'app.tsx';
 const OUT_FILE = 'index.html';
 
 // Resolve from project root
 process.chdir(__dirname);
 
-if (!fs.existsSync(DEV_FILE)) {
-    console.error(`Error: ${DEV_FILE} not found. Edit ${DEV_FILE} (not ${OUT_FILE}) for development.`);
-    process.exit(1);
+for (const f of [DEV_FILE, CSS_FILE, JSX_FILE]) {
+    if (!fs.existsSync(f)) {
+        console.error(`Error: ${f} not found.`);
+        process.exit(1);
+    }
 }
 
 // Find Babel — check build_deps/ first, then node_modules/
@@ -34,32 +38,36 @@ if (!babelCore) {
     process.exit(1);
 }
 
+// Read sources
 const html = fs.readFileSync(DEV_FILE, 'utf8');
+const css = fs.readFileSync(CSS_FILE, 'utf8');
+const jsxSource = fs.readFileSync(JSX_FILE, 'utf8');
 
-// Find <script type="text/babel"> block
-const openTag = '<script type="text/babel">';
-const babelStart = html.indexOf(openTag);
-if (babelStart === -1) {
-    console.error(`No ${openTag} found in ${DEV_FILE}`);
-    process.exit(1);
-}
-const babelEnd = html.indexOf('</script>', babelStart) + '</script>'.length;
+console.log(`Compiling ${jsxSource.length.toLocaleString()} chars of JSX...`);
 
-const jsxSource = html.substring(babelStart + openTag.length, babelEnd - '</script>'.length);
-console.log(`Compiling ${jsxSource.length} chars of JSX...`);
-
+// Compile JSX → plain JS
 const result = babelCore.transformSync(jsxSource, {
     presets: [presetReact],
-    filename: 'app.jsx',
+    filename: JSX_FILE,
     sourceType: 'script',
 });
 
-// Reassemble with compiled JS
-let out = html.substring(0, babelStart)
-    + '<script>\n' + result.code + '\n    </script>'
-    + html.substring(babelEnd);
+// Build output: inline CSS and compiled JS into HTML
+let out = html;
 
-// Remove Babel standalone CDN script
+// Replace <link rel="stylesheet" href="app.css"> with inline <style>
+out = out.replace(
+    /\s*<link rel="stylesheet" href="app\.css">/,
+    '\n    <style>\n' + css.split('\n').map(l => '        ' + l).join('\n') + '\n    </style>'
+);
+
+// Replace <script type="text/babel" src="app.jsx"></script> with inline compiled <script>
+out = out.replace(
+    /<script type="text\/babel" src="app\.tsx"><\/script>/,
+    '<script>\n' + result.code + '\n    </script>'
+);
+
+// Remove Babel standalone CDN script (not needed in production)
 out = out.replace(
     /\s*<script src="https:\/\/unpkg\.com\/@babel\/standalone\/babel\.min\.js"><\/script>\n?/,
     '\n'
@@ -84,8 +92,8 @@ if (!out.includes('rel="preconnect"')) {
 
 fs.writeFileSync(OUT_FILE, out, 'utf8');
 
-const devSize = fs.statSync(DEV_FILE).size;
+const srcSize = fs.statSync(CSS_FILE).size + fs.statSync(JSX_FILE).size + fs.statSync(DEV_FILE).size;
 const outSize = fs.statSync(OUT_FILE).size;
-console.log(`  ${DEV_FILE} (${devSize.toLocaleString()} bytes)`);
+console.log(`  Sources: ${DEV_FILE} + ${CSS_FILE} + ${JSX_FILE} (${srcSize.toLocaleString()} bytes)`);
 console.log(`→ ${OUT_FILE} (${outSize.toLocaleString()} bytes)`);
-console.log(`  Babel removed, JSX compiled, React production builds`);
+console.log(`  CSS inlined, JSX compiled, Babel removed, React production builds`);

@@ -867,13 +867,33 @@ class TarParser {
     }
     onProgress(50, 'Parsing tar archive...');
 
-    // Parse tar entries by reading slices from the OPFS file (low memory)
+    // Parse tar entries using chunked buffered reads (avoids excessive file.slice calls)
     const tarFile = await tempHandle.getFile();
     const tarSize = tarFile.size;
     const decoder = new TextDecoder();
-    const readSlice = async (offset, length) => {
-      const blob = tarFile.slice(offset, offset + length);
-      return new Uint8Array(await blob.arrayBuffer());
+
+    // Buffered reader: reads large chunks to minimize file resource calls
+    const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks
+    let chunkBuf = null;
+    let chunkStart = -1; // file offset where chunkBuf starts
+    let chunkLen = 0;
+    const ensureBuffered = async (fileOffset, needed) => {
+      // If the requested range is within our current buffer, no-op
+      if (chunkBuf && fileOffset >= chunkStart && fileOffset + needed <= chunkStart + chunkLen) {
+        return;
+      }
+      // Read a new chunk from the file
+      const readSize = Math.max(CHUNK_SIZE, needed);
+      const end = Math.min(fileOffset + readSize, tarSize);
+      const blob = tarFile.slice(fileOffset, end);
+      chunkBuf = new Uint8Array(await blob.arrayBuffer());
+      chunkStart = fileOffset;
+      chunkLen = chunkBuf.length;
+    };
+    const readBytes = async (fileOffset, length) => {
+      await ensureBuffered(fileOffset, length);
+      const localOffset = fileOffset - chunkStart;
+      return chunkBuf.subarray(localOffset, localOffset + length);
     };
     const readStr = (buf, start, len) => {
       return decoder.decode(buf.slice(start, start + len)).split('\0')[0];
@@ -892,11 +912,11 @@ class TarParser {
     let offset = 0;
     let entryCount = 0;
     while (offset < tarSize - 512) {
-      const headerBuf = await readSlice(offset, 512);
+      const headerBuf = await readBytes(offset, 512);
       if (isNullBlock(headerBuf)) {
         offset += 512;
         if (offset < tarSize - 512) {
-          const nextBuf = await readSlice(offset, 512);
+          const nextBuf = await readBytes(offset, 512);
           if (isNullBlock(nextBuf)) break; // double null = end of archive
         } else break;
         continue;
@@ -923,9 +943,12 @@ class TarParser {
         const isPLSQL = fullName.endsWith('.PLSQL') || fullName.endsWith('.EPSQL');
         const maxSize = isPLSQL ? 200 * 1024 * 1024 : 2 * 1024 * 1024;
         if (isFileEntry && !isDir && size > 0 && size < maxSize) {
-          // Read only this file's data from disk — not the whole tar
-          const fileData = await readSlice(offset, size);
-          entry.data = isPLSQL ? fileData : fileData.buffer.slice(fileData.byteOffset, fileData.byteOffset + fileData.byteLength);
+          // Read file data from buffered chunks — no extra file.slice per entry
+          const fileData = await readBytes(offset, size);
+          // Must copy since readBytes returns a subarray of the shared chunk buffer
+          const copied = new Uint8Array(size);
+          copied.set(fileData);
+          entry.data = isPLSQL ? copied : copied.buffer.slice(copied.byteOffset, copied.byteOffset + copied.byteLength);
           entry.isPLSQL = isPLSQL;
         }
         entries.push(entry);
@@ -2740,6 +2763,468 @@ function SystemPerformanceDashboard({
 }
 
 // ===== CRASHES & DIAGNOSTICS DASHBOARD =====
+
+// ============================================================================
+// CrashDetailView - Enhanced crash .ips file parser and viewer
+// Supports JSON + header-line fallback, all-threads view, exception codes,
+// coalition info, and plaintext .ips fallback parsing
+// ============================================================================
+function CrashDetailView({
+  fileData,
+  crashInfo
+}) {
+  const [detail, setDetail] = useState(null);
+  const [showAllThreads, setShowAllThreads] = useState(false);
+  useEffect(() => {
+    if (!fileData) {
+      setDetail(null);
+      return;
+    }
+    try {
+      const decoder = new TextDecoder('utf-8', {
+        fatal: false
+      });
+      const buf = fileData instanceof ArrayBuffer ? new Uint8Array(fileData) : fileData;
+      const text = decoder.decode(buf);
+      const parsed = {};
+
+      // Try JSON parse (most IPS files are JSON or have JSON after a header line)
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (_) {
+        // Some .ips files have a header line then JSON
+        const nlIdx = text.indexOf('\n');
+        if (nlIdx > 0) {
+          try {
+            json = JSON.parse(text.substring(nlIdx + 1));
+          } catch (_2) {}
+        }
+      }
+      if (json) {
+        parsed.exception_type = json.exception && json.exception.type || '';
+        parsed.exception_subtype = json.exception && json.exception.subtype || '';
+        parsed.exception_message = json.exception && json.exception.message || '';
+        parsed.exception_codes = json.exception && json.exception.codes || '';
+        parsed.termination_reason = json.termination && json.termination.reason || '';
+        parsed.termination_namespace = json.termination && json.termination.namespace || '';
+        parsed.faulting_thread = json.faultingThread !== undefined ? json.faultingThread : '';
+        parsed.bug_type = json.bug_type || '';
+        parsed.process = json.procName || json.processName || '';
+        parsed.pid = json.pid || '';
+        parsed.os_version = json.osVersion || '';
+        parsed.incident_id = json.incident || '';
+        parsed.hardware_model = json.modelCode || '';
+        parsed.parentProcess = json.parentProc || '';
+        parsed.coalitionName = json.coalitionName || '';
+
+        // Extract all thread stack traces
+        parsed.threads = [];
+        if (json.threads && Array.isArray(json.threads)) {
+          json.threads.forEach((thread, idx) => {
+            parsed.threads.push({
+              index: idx,
+              name: thread.name || 'Thread ' + idx,
+              triggered: thread.triggered || false,
+              isFaulting: idx === json.faultingThread,
+              frames: (thread.frames || []).map(fr => ({
+                imageOffset: fr.imageOffset,
+                imageName: fr.imageName || '',
+                symbol: fr.symbol || '',
+                symbolLocation: fr.symbolLocation || 0,
+                address: fr.address || ''
+              }))
+            });
+          });
+        }
+
+        // Extract faulting thread frames separately for easy access
+        if (json.threads && json.threads[json.faultingThread]) {
+          const thread = json.threads[json.faultingThread];
+          parsed.thread_name = thread.name || 'Thread ' + json.faultingThread;
+          parsed.frames = (thread.frames || []).map(fr => ({
+            imageOffset: fr.imageOffset,
+            imageName: fr.imageName || '',
+            symbol: fr.symbol || '',
+            symbolLocation: fr.symbolLocation || 0,
+            address: fr.address || ''
+          }));
+        } else {
+          parsed.frames = [];
+        }
+      } else {
+        // Fallback: regex parse for non-JSON .ips files
+        parsed.exception_type = '';
+        parsed.termination_reason = '';
+        parsed.process = crashInfo ? crashInfo.process : '';
+        parsed.frames = [];
+        parsed.threads = [];
+
+        // Try to extract crashed thread dump text
+        const threadMatch = text.match(/Thread \d+[^\n]*Crashed[^\n]*:\n([\s\S]{0,5000}?)(?:\nThread \d|\n\n)/);
+        if (threadMatch) {
+          parsed.raw_stack = threadMatch[1];
+        }
+
+        // Try to extract exception info from plaintext
+        const excMatch = text.match(/Exception Type:\s*(.+)/);
+        if (excMatch) parsed.exception_type = excMatch[1].trim();
+        const termMatch = text.match(/Termination Reason:\s*(.+)/);
+        if (termMatch) parsed.termination_reason = termMatch[1].trim();
+        const trigMatch = text.match(/Triggered by Thread:\s*(\d+)/);
+        if (trigMatch) parsed.faulting_thread = parseInt(trigMatch[1], 10);
+      }
+      setDetail(parsed);
+    } catch (e) {
+      setDetail({
+        error: e.message
+      });
+    }
+  }, [fileData, crashInfo]);
+  if (!detail) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: 'center',
+        padding: '48px 16px',
+        color: '#6e7681',
+        fontSize: '13px'
+      }
+    }, "Select a crash report from the list to view details");
+  }
+  if (detail.error) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        color: '#f85149',
+        fontSize: '12px'
+      }
+    }, "Error parsing crash: ", detail.error);
+  }
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '12px',
+      fontSize: '14px',
+      fontWeight: 600,
+      color: '#e6edf3'
+    }
+  }, detail.process || crashInfo && crashInfo.process, detail.pid && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: '12px',
+      color: '#8b949e',
+      marginLeft: '8px'
+    }
+  }, "PID ", detail.pid)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '10px',
+      marginBottom: '16px'
+    }
+  }, detail.exception_type && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "Exception Type"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#f85149',
+      fontWeight: 600
+    }
+  }, detail.exception_type)), detail.exception_subtype && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "Exception Subtype"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#d29922',
+      fontWeight: 600
+    }
+  }, detail.exception_subtype)), detail.exception_codes && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "Exception Codes"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#f778ba',
+      fontWeight: 600,
+      fontFamily: 'monospace'
+    }
+  }, detail.exception_codes)), detail.termination_reason && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "Termination Reason"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#bc8cff',
+      fontWeight: 600
+    }
+  }, detail.termination_reason)), detail.termination_namespace && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "Namespace"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#58a6ff',
+      fontWeight: 600
+    }
+  }, detail.termination_namespace)), detail.faulting_thread !== '' && detail.faulting_thread !== undefined && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "Faulting Thread"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#3fb950',
+      fontWeight: 600
+    }
+  }, detail.faulting_thread)), detail.bug_type && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "Bug Type"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#e6edf3',
+      fontWeight: 600
+    }
+  }, BUG_TYPE_MAP[detail.bug_type] || detail.bug_type)), detail.os_version && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "OS Version"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#8b949e',
+      fontWeight: 600
+    }
+  }, detail.os_version)), detail.coalitionName && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '6px 12px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '10px',
+      color: '#8b949e'
+    }
+  }, "Coalition"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      color: '#8b949e',
+      fontWeight: 600
+    }
+  }, detail.coalitionName))), detail.exception_message && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...chartPanelStyle,
+      marginBottom: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: chartPanelHeaderStyle
+  }, /*#__PURE__*/React.createElement("span", null, "Exception Message")), /*#__PURE__*/React.createElement("pre", {
+    style: {
+      fontFamily: 'monospace',
+      fontSize: '11px',
+      color: '#f85149',
+      whiteSpace: 'pre-wrap',
+      margin: 0
+    }
+  }, detail.exception_message)), detail.frames && detail.frames.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...chartPanelStyle,
+      maxHeight: '400px',
+      overflowY: 'auto',
+      marginBottom: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: chartPanelHeaderStyle
+  }, /*#__PURE__*/React.createElement("span", null, "Stack Trace", detail.thread_name ? ' (' + detail.thread_name + ')' : '')), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: 'monospace',
+      fontSize: '11px',
+      lineHeight: '1.6'
+    }
+  }, detail.frames.map((fr, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      gap: '8px',
+      padding: '2px 0',
+      borderBottom: '1px solid #21262d'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      minWidth: '24px',
+      textAlign: 'right'
+    }
+  }, i), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#58a6ff',
+      minWidth: '180px',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, fr.imageName), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: fr.symbol ? '#e6edf3' : '#6e7681',
+      flex: 1,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, fr.symbol ? fr.symbol + ' + ' + fr.symbolLocation : '0x' + (fr.imageOffset || 0).toString(16)))))), detail.threads && detail.threads.length > 1 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: 'time-button ' + (showAllThreads ? 'active' : ''),
+    onClick: () => setShowAllThreads(!showAllThreads),
+    style: {
+      fontSize: '11px'
+    }
+  }, showAllThreads ? 'Hide' : 'Show', " All Threads (", detail.threads.length, ")"), showAllThreads && detail.threads.map((thread, tidx) => /*#__PURE__*/React.createElement("div", {
+    key: tidx,
+    style: {
+      ...chartPanelStyle,
+      marginTop: '8px',
+      maxHeight: '300px',
+      overflowY: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: chartPanelHeaderStyle
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: thread.isFaulting ? '#f85149' : '#e6edf3'
+    }
+  }, thread.name, thread.isFaulting ? ' (Crashed)' : '')), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: 'monospace',
+      fontSize: '11px',
+      lineHeight: '1.6'
+    }
+  }, thread.frames.slice(0, 20).map((fr, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      gap: '8px',
+      padding: '1px 0'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      minWidth: '24px',
+      textAlign: 'right'
+    }
+  }, i), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#58a6ff',
+      minWidth: '160px',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, fr.imageName), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: fr.symbol ? '#e6edf3' : '#6e7681',
+      flex: 1,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, fr.symbol ? fr.symbol + ' + ' + fr.symbolLocation : '0x' + (fr.imageOffset || 0).toString(16)))), thread.frames.length > 20 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: '#6e7681',
+      fontSize: '11px',
+      padding: '4px 0'
+    }
+  }, "... ", thread.frames.length - 20, " more frames"))))), detail.raw_stack && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...chartPanelStyle,
+      maxHeight: '350px',
+      overflowY: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: chartPanelHeaderStyle
+  }, /*#__PURE__*/React.createElement("span", null, "Stack Trace (Crashed Thread)")), /*#__PURE__*/React.createElement("pre", {
+    style: {
+      fontFamily: 'monospace',
+      fontSize: '11px',
+      color: '#e6edf3',
+      whiteSpace: 'pre-wrap',
+      margin: 0
+    }
+  }, detail.raw_stack)));
+}
 function CrashesDashboard({
   files,
   sectionFiles
@@ -2747,6 +3232,7 @@ function CrashesDashboard({
   const [crashes, setCrashes] = useState([]);
   const [selectedFile, setSelectedFile] = useState(null);
   const [activeTab, setActiveTab] = useState('summary');
+  const [selectedCrash, setSelectedCrash] = useState(null);
   const chartRef = useRef(null);
   const chartInstance = useRef(null);
   useEffect(() => {
@@ -2847,11 +3333,11 @@ function CrashesDashboard({
     className: "dashboard-container"
   }, /*#__PURE__*/React.createElement("div", {
     className: "tab-bar"
-  }, ['summary', 'timeline'].map(tab => /*#__PURE__*/React.createElement("div", {
+  }, ['summary', 'timeline', 'detail'].map(tab => /*#__PURE__*/React.createElement("div", {
     key: tab,
     className: `tab ${activeTab === tab ? 'active' : ''}`,
     onClick: () => setActiveTab(tab)
-  }, tab === 'summary' ? 'Event Summary' : 'Event Timeline'))), activeTab === 'summary' && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  }, tab === 'summary' ? 'Event Summary' : tab === 'timeline' ? 'Event Timeline' : 'Crash Detail'))), activeTab === 'summary' && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       flexWrap: 'wrap',
@@ -3027,7 +3513,53 @@ function CrashesDashboard({
       color: '#6e7681',
       fontSize: '11px'
     }
-  }, formatBytes(c.size))))), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+  }, formatBytes(c.size))))), activeTab === 'detail' && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: '12px',
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: '280px',
+      maxHeight: '500px',
+      overflowY: 'auto',
+      flexShrink: 0
+    }
+  }, crashes.filter(c => c.basename.endsWith('.ips')).map((c, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    onClick: () => {
+      setSelectedCrash(c);
+    },
+    style: {
+      padding: '6px 10px',
+      borderBottom: '1px solid #21262d',
+      cursor: 'pointer',
+      fontSize: '12px',
+      backgroundColor: selectedCrash && selectedCrash.name === c.name ? '#1f2937' : 'transparent',
+      borderLeft: selectedCrash && selectedCrash.name === c.name ? '2px solid #58a6ff' : '2px solid transparent'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: '#e6edf3',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, c.process), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: '#8b949e',
+      fontSize: '11px'
+    }
+  }, c.type, ' ', c.date)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement(CrashDetailView, {
+    fileData: selectedCrash ? (sectionFiles.find(f => f.name === selectedCrash.name) || {}).data : null,
+    crashInfo: selectedCrash
+  })))), /*#__PURE__*/React.createElement(CollapsibleFileList, {
     files: sectionFiles,
     selectedFile: selectedFile,
     setSelectedFile: setSelectedFile
@@ -3274,6 +3806,1153 @@ function StorageDashboard({
       whiteSpace: 'nowrap'
     }
   }, m.flags.join(', ')))))), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== POWERLOG EXTENDED QUERIES DASHBOARD =====
+function PowerLogDashboard({
+  files,
+  sectionFiles
+}) {
+  const [db, setDb] = useState(null);
+  const [dbLoading, setDbLoading] = useState(true);
+  const [dbError, setDbError] = useState(null);
+  const [tables, setTables] = useState([]);
+  const [selectedPreset, setSelectedPreset] = useState('');
+  const [customSql, setCustomSql] = useState('');
+  const [queryResult, setQueryResult] = useState(null);
+  const [queryError, setQueryError] = useState(null);
+  const [sortCol, setSortCol] = useState(null);
+  const [sortAsc, setSortAsc] = useState(true);
+  const [activeTab, setActiveTab] = useState('query');
+  const [selectedFile, setSelectedFile] = useState(null);
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  const PRESETS = [{
+    label: 'Display Brightness History',
+    sql: "SELECT timestamp, Level as brightness FROM PLDisplayAgent_EventPoint_Display ORDER BY timestamp ASC LIMIT 2000"
+  }, {
+    label: 'App Usage Timeline',
+    sql: "SELECT timestamp, BundleID as app, ScreenOn FROM PLApplicationAgent_EventForward_Application ORDER BY timestamp DESC LIMIT 500"
+  }, {
+    label: 'Network Activity',
+    sql: "SELECT timestamp, RxBytes, TxBytes, DataConnectionType as type FROM PLNetworkAgent_EventPoint_NetworkInOut ORDER BY timestamp DESC LIMIT 1000"
+  }, {
+    label: 'Location Usage',
+    sql: "SELECT timestamp, Client, Type, Accuracy FROM PLLocationAgent_EventForward_ClientStatus ORDER BY timestamp DESC LIMIT 500"
+  }, {
+    label: 'Battery Level Over Time',
+    sql: "SELECT timestamp, Level, InstantAmperage, Voltage, Temperature FROM PLBatteryAgent_EventBackward_Battery ORDER BY timestamp ASC LIMIT 2000"
+  }, {
+    label: 'All Tables',
+    sql: "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+  }];
+  useEffect(() => {
+    let database = null;
+    (async () => {
+      try {
+        const plsqlFile = files.find(f => (f.name.endsWith('.PLSQL') || f.name.endsWith('.EPSQL')) && f.data);
+        if (!plsqlFile) {
+          setDbError('No PowerLog database found. PLSQL data may have been freed from memory - try reloading the archive.');
+          setDbLoading(false);
+          return;
+        }
+        const SQL = await getSqlJs();
+        const buf = plsqlFile.data instanceof ArrayBuffer ? new Uint8Array(plsqlFile.data) : plsqlFile.data;
+        database = new SQL.Database(buf);
+        setDb(database);
+        const res = database.exec("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+        if (res.length > 0) setTables(res[0].values.map(r => r[0]));
+        setDbLoading(false);
+      } catch (e) {
+        console.error('PowerLog DB error:', e);
+        setDbError('Failed to open PowerLog database: ' + e.message);
+        setDbLoading(false);
+      }
+    })();
+    return () => {
+      if (database) try {
+        database.close();
+      } catch (_) {}
+    };
+  }, [files]);
+  const runQuery = sql => {
+    if (!db || !sql.trim()) return;
+    setQueryError(null);
+    setQueryResult(null);
+    setSortCol(null);
+    try {
+      const results = db.exec(sql);
+      if (results.length === 0) {
+        setQueryResult({
+          columns: [],
+          rows: []
+        });
+      } else {
+        const cols = results[0].columns;
+        const rows = results[0].values.map(row => {
+          const obj = {};
+          cols.forEach((c, i) => {
+            let val = row[i];
+            if (c === 'timestamp' && typeof val === 'number' && val > 1e9 && val < 2e10) {
+              obj[c + '_raw'] = val;
+              val = new Date(val * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+            }
+            obj[c] = val;
+          });
+          return obj;
+        });
+        setQueryResult({
+          columns: cols,
+          rows: rows
+        });
+      }
+    } catch (e) {
+      setQueryError(e.message);
+    }
+  };
+  const handlePresetChange = idx => {
+    if (idx === '') {
+      setSelectedPreset('');
+      return;
+    }
+    setSelectedPreset(idx);
+    setCustomSql(PRESETS[idx].sql);
+    runQuery(PRESETS[idx].sql);
+  };
+  const sortedRows = useMemo(() => {
+    if (!queryResult || !queryResult.rows.length || sortCol === null) return queryResult ? queryResult.rows : [];
+    const col = queryResult.columns[sortCol];
+    return [...queryResult.rows].sort((a, b) => {
+      const va = a[col],
+        vb = b[col];
+      if (typeof va === 'number' && typeof vb === 'number') return sortAsc ? va - vb : vb - va;
+      return sortAsc ? String(va != null ? va : '').localeCompare(String(vb != null ? vb : '')) : String(vb != null ? vb : '').localeCompare(String(va != null ? va : ''));
+    });
+  }, [queryResult, sortCol, sortAsc]);
+  useEffect(() => {
+    if (chartInstance.current) {
+      chartInstance.current.destroy();
+      chartInstance.current = null;
+    }
+    if (!chartRef.current || !queryResult || queryResult.rows.length === 0 || activeTab !== 'chart') return;
+    if (!queryResult.columns.includes('timestamp')) return;
+    const numCols = queryResult.columns.filter(c => c !== 'timestamp' && c !== 'timestamp_raw' && queryResult.rows.some(r => typeof r[c] === 'number'));
+    if (!numCols.length) return;
+    const pal = ['#58a6ff', '#3fb950', '#f85149', '#d29922', '#bc8cff', '#f778ba'];
+    chartInstance.current = new Chart(chartRef.current.getContext('2d'), {
+      type: 'line',
+      data: {
+        datasets: numCols.slice(0, 6).map((col, i) => ({
+          label: col,
+          data: queryResult.rows.map(r => ({
+            x: r.timestamp_raw ? new Date(r.timestamp_raw * 1000) : new Date(r.timestamp),
+            y: r[col]
+          })),
+          borderColor: pal[i % pal.length],
+          backgroundColor: pal[i % pal.length] + '33',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          fill: false,
+          tension: 0.2
+        }))
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: {
+          mode: 'index',
+          intersect: false
+        },
+        plugins: {
+          legend: {
+            labels: {
+              color: '#e6edf3',
+              usePointStyle: true,
+              padding: 12
+            }
+          },
+          zoom: chartZoomOptions
+        },
+        scales: {
+          x: {
+            type: 'time',
+            grid: {
+              color: '#30363d'
+            },
+            ticks: {
+              color: '#8b949e',
+              maxTicksLimit: 10
+            }
+          },
+          y: {
+            grid: {
+              color: '#30363d'
+            },
+            ticks: {
+              color: '#8b949e'
+            }
+          }
+        }
+      }
+    });
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+        chartInstance.current = null;
+      }
+    };
+  }, [queryResult, activeTab]);
+  if (dbLoading) return React.createElement("div", {
+    className: "dashboard-container"
+  }, React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '32px',
+      color: '#8b949e'
+    }
+  }, "Loading PowerLog database..."));
+  if (dbError) return React.createElement("div", {
+    className: "dashboard-container"
+  }, React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '32px',
+      color: '#8b949e'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: '32px',
+      marginBottom: '12px',
+      opacity: 0.5
+    }
+  }, "\uD83D\uDD0C"), React.createElement("div", {
+    style: {
+      fontSize: '14px',
+      color: '#d29922',
+      marginBottom: '8px'
+    }
+  }, dbError)), React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+  const showChart = queryResult && queryResult.columns.includes('timestamp') && queryResult.columns.some(c => c !== 'timestamp' && c !== 'timestamp_raw' && queryResult.rows.some(r => typeof r[c] === 'number'));
+  return React.createElement("div", {
+    className: "dashboard-container"
+  }, React.createElement("div", {
+    style: {
+      marginBottom: '12px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      fontWeight: 600,
+      color: '#e6edf3',
+      marginBottom: '8px'
+    }
+  }, "PowerLog SQL Explorer", tables.length > 0 && React.createElement("span", {
+    style: {
+      fontWeight: 400,
+      color: '#8b949e',
+      marginLeft: '8px'
+    }
+  }, tables.length + " tables")), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: '8px',
+      marginBottom: '8px',
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("select", {
+    value: selectedPreset,
+    onChange: function (e) {
+      handlePresetChange(e.target.value);
+    },
+    style: {
+      padding: '6px 10px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '6px',
+      color: '#e6edf3',
+      fontSize: '12px'
+    }
+  }, React.createElement("option", {
+    value: ''
+  }, "Select a preset query..."), PRESETS.map(function (p, i) {
+    return React.createElement("option", {
+      key: i,
+      value: i
+    }, p.label);
+  }))), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: '8px'
+    }
+  }, React.createElement("textarea", {
+    value: customSql,
+    onChange: function (e) {
+      setCustomSql(e.target.value);
+    },
+    onKeyDown: function (e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) runQuery(customSql);
+    },
+    placeholder: "Enter SQL query... (Ctrl+Enter to run)",
+    style: {
+      flex: 1,
+      padding: '8px',
+      backgroundColor: '#0d1117',
+      border: '1px solid #30363d',
+      borderRadius: '6px',
+      color: '#e6edf3',
+      fontSize: '12px',
+      fontFamily: 'monospace',
+      minHeight: '60px',
+      resize: 'vertical'
+    }
+  }), React.createElement("button", {
+    onClick: function () {
+      runQuery(customSql);
+    },
+    style: {
+      padding: '8px 16px',
+      backgroundColor: '#238636',
+      border: 'none',
+      borderRadius: '6px',
+      color: '#fff',
+      fontSize: '12px',
+      fontWeight: 600,
+      cursor: 'pointer',
+      alignSelf: 'flex-start'
+    }
+  }, "Run"))), queryError && React.createElement("div", {
+    style: {
+      padding: '8px 12px',
+      backgroundColor: '#f8514922',
+      border: '1px solid #f85149',
+      borderRadius: '6px',
+      color: '#f85149',
+      fontSize: '12px',
+      marginBottom: '12px',
+      fontFamily: 'monospace'
+    }
+  }, queryError), queryResult && React.createElement("div", null, showChart && React.createElement("div", {
+    className: "tab-bar",
+    style: {
+      marginBottom: '12px'
+    }
+  }, ['query', 'chart'].map(function (t) {
+    return React.createElement("div", {
+      key: t,
+      className: "tab " + (activeTab === t ? 'active' : ''),
+      onClick: function () {
+        setActiveTab(t);
+      }
+    }, t === 'query' ? 'Table Results' : 'Time Series Chart');
+  })), activeTab === 'chart' && showChart && React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: '300px',
+      marginBottom: '16px'
+    }
+  }, React.createElement("canvas", {
+    ref: chartRef
+  })), (activeTab === 'query' || !showChart) && React.createElement("div", null, React.createElement("div", {
+    style: {
+      fontSize: '12px',
+      color: '#8b949e',
+      marginBottom: '8px'
+    }
+  }, queryResult.rows.length + " rows"), queryResult.rows.length > 0 && React.createElement("div", {
+    style: {
+      overflowX: 'auto',
+      maxHeight: '400px',
+      overflowY: 'auto'
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      fontSize: '11px',
+      borderCollapse: 'collapse'
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      borderBottom: '1px solid #30363d',
+      position: 'sticky',
+      top: 0,
+      backgroundColor: '#0d1117',
+      zIndex: 1
+    }
+  }, queryResult.columns.filter(function (c) {
+    return !c.endsWith('_raw');
+  }).map(function (col, i) {
+    return React.createElement("th", {
+      key: col,
+      onClick: function () {
+        if (sortCol === i) setSortAsc(!sortAsc);else {
+          setSortCol(i);
+          setSortAsc(true);
+        }
+      },
+      style: {
+        padding: '6px 8px',
+        textAlign: 'left',
+        color: '#8b949e',
+        fontWeight: 500,
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+        userSelect: 'none'
+      }
+    }, col, sortCol === i ? sortAsc ? ' \u25B2' : ' \u25BC' : '');
+  }))), React.createElement("tbody", null, sortedRows.slice(0, 500).map(function (row, ri) {
+    return React.createElement("tr", {
+      key: ri,
+      style: {
+        borderBottom: '1px solid #21262d'
+      }
+    }, queryResult.columns.filter(function (c) {
+      return !c.endsWith('_raw');
+    }).map(function (col) {
+      return React.createElement("td", {
+        key: col,
+        style: {
+          padding: '4px 8px',
+          color: '#e6edf3',
+          fontFamily: typeof row[col] === 'number' ? 'monospace' : 'inherit',
+          whiteSpace: 'nowrap'
+        }
+      }, row[col] != null ? String(row[col]) : '');
+    }));
+  })))), queryResult.rows.length > 500 && React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e',
+      marginTop: '8px'
+    }
+  }, "Showing first 500 of " + queryResult.rows.length + " rows"))), React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== PROCESS RESOURCE ANALYSIS DASHBOARD =====
+function ProcessDashboard({
+  files,
+  sectionFiles
+}) {
+  const [processes, setProcesses] = useState([]);
+  const [sortCol, setSortCol] = useState('cpuTotal');
+  const [sortAsc, setSortAsc] = useState(false);
+  const [activeTab, setActiveTab] = useState('table');
+  const [selectedFile, setSelectedFile] = useState(null);
+  const cpuChartRef = useRef(null);
+  const cpuChartInstance = useRef(null);
+  const memChartRef = useRef(null);
+  const memChartInstance = useRef(null);
+  useEffect(() => {
+    const decoder = new TextDecoder('utf-8', {
+      fatal: false
+    });
+    const decode = f => {
+      const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+      return decoder.decode(buf);
+    };
+    const taskFile = files.find(f => f.name.includes('taskinfo') && f.data);
+    if (!taskFile) return;
+    const text = decode(taskFile);
+    const lines = text.split('\n');
+    const procs = [];
+    let cur = null;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const pm = line.match(/^proc\s+\d+:\s+(.+?)\s+\[pid\s+(\d+)/);
+      if (pm) {
+        if (cur) procs.push(cur);
+        cur = {
+          name: pm[1],
+          pid: parseInt(pm[2]),
+          cpuUser: 0,
+          cpuSystem: 0,
+          cpuTotal: 0,
+          residentMem: 0,
+          virtualMem: 0,
+          threads: 0
+        };
+        continue;
+      }
+      if (!cur) continue;
+      const cm = line.match(/user\s+time:\s+([\d.]+)s.*system\s+time:\s+([\d.]+)s/);
+      if (cm) {
+        cur.cpuUser = parseFloat(cm[1]) || 0;
+        cur.cpuSystem = parseFloat(cm[2]) || 0;
+        cur.cpuTotal = cur.cpuUser + cur.cpuSystem;
+      }
+      const rm = line.match(/resident\s+size:\s+([\d]+)/i);
+      if (rm) cur.residentMem = parseInt(rm[1]) || 0;
+      const vm2 = line.match(/virtual\s+size:\s+([\d]+)/i);
+      if (vm2) cur.virtualMem = parseInt(vm2[1]) || 0;
+      const tm = line.match(/(\d+)\s+threads/);
+      if (tm) cur.threads = parseInt(tm[1]) || 0;
+    }
+    if (cur) procs.push(cur);
+    setProcesses(procs);
+  }, [files]);
+  const sorted = useMemo(() => {
+    if (!processes.length) return [];
+    return [...processes].sort((a, b) => {
+      const va = a[sortCol],
+        vb = b[sortCol];
+      if (typeof va === 'number' && typeof vb === 'number') return sortAsc ? va - vb : vb - va;
+      return sortAsc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
+    });
+  }, [processes, sortCol, sortAsc]);
+  const top20Cpu = useMemo(() => [...processes].sort((a, b) => b.cpuTotal - a.cpuTotal).slice(0, 20), [processes]);
+  const top20Mem = useMemo(() => [...processes].sort((a, b) => b.residentMem - a.residentMem).slice(0, 20), [processes]);
+  useEffect(() => {
+    if (cpuChartInstance.current) {
+      cpuChartInstance.current.destroy();
+      cpuChartInstance.current = null;
+    }
+    if (!cpuChartRef.current || !top20Cpu.length || activeTab !== 'cpu') return;
+    cpuChartInstance.current = new Chart(cpuChartRef.current.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: top20Cpu.map(p => p.name),
+        datasets: [{
+          label: 'User (s)',
+          data: top20Cpu.map(p => p.cpuUser),
+          backgroundColor: '#58a6ff',
+          borderRadius: 4
+        }, {
+          label: 'System (s)',
+          data: top20Cpu.map(p => p.cpuSystem),
+          backgroundColor: '#f85149',
+          borderRadius: 4
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            labels: {
+              color: '#e6edf3',
+              usePointStyle: true,
+              padding: 12
+            }
+          }
+        },
+        scales: {
+          x: {
+            stacked: true,
+            grid: {
+              color: '#30363d'
+            },
+            ticks: {
+              color: '#8b949e',
+              callback: v => v.toFixed(1) + 's'
+            }
+          },
+          y: {
+            stacked: true,
+            grid: {
+              display: false
+            },
+            ticks: {
+              color: '#e6edf3',
+              font: {
+                size: 11
+              }
+            }
+          }
+        }
+      }
+    });
+    return () => {
+      if (cpuChartInstance.current) {
+        cpuChartInstance.current.destroy();
+        cpuChartInstance.current = null;
+      }
+    };
+  }, [top20Cpu, activeTab]);
+  useEffect(() => {
+    if (memChartInstance.current) {
+      memChartInstance.current.destroy();
+      memChartInstance.current = null;
+    }
+    if (!memChartRef.current || !top20Mem.length || activeTab !== 'memory') return;
+    memChartInstance.current = new Chart(memChartRef.current.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: top20Mem.map(p => p.name),
+        datasets: [{
+          label: 'Resident Memory',
+          data: top20Mem.map(p => p.residentMem),
+          backgroundColor: '#3fb950',
+          borderRadius: 4
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            labels: {
+              color: '#e6edf3',
+              usePointStyle: true,
+              padding: 12
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: {
+              color: '#30363d'
+            },
+            ticks: {
+              color: '#8b949e',
+              callback: v => formatBytes(v)
+            }
+          },
+          y: {
+            grid: {
+              display: false
+            },
+            ticks: {
+              color: '#e6edf3',
+              font: {
+                size: 11
+              }
+            }
+          }
+        }
+      }
+    });
+    return () => {
+      if (memChartInstance.current) {
+        memChartInstance.current.destroy();
+        memChartInstance.current = null;
+      }
+    };
+  }, [top20Mem, activeTab]);
+  const pcols = [{
+    key: 'name',
+    label: 'Process'
+  }, {
+    key: 'pid',
+    label: 'PID'
+  }, {
+    key: 'cpuTotal',
+    label: 'CPU Total (s)'
+  }, {
+    key: 'cpuUser',
+    label: 'User (s)'
+  }, {
+    key: 'cpuSystem',
+    label: 'System (s)'
+  }, {
+    key: 'residentMem',
+    label: 'Resident Mem'
+  }, {
+    key: 'virtualMem',
+    label: 'Virtual Mem'
+  }, {
+    key: 'threads',
+    label: 'Threads'
+  }];
+  return React.createElement("div", {
+    className: "dashboard-container"
+  }, React.createElement("div", {
+    className: "tab-bar"
+  }, ['table', 'cpu', 'memory'].map(tab => React.createElement("div", {
+    key: tab,
+    className: "tab " + (activeTab === tab ? 'active' : ''),
+    onClick: () => setActiveTab(tab)
+  }, tab === 'table' ? 'Process Table (' + processes.length + ')' : tab === 'cpu' ? 'Top 20 CPU' : 'Top 20 Memory'))), activeTab === 'table' && React.createElement("div", {
+    style: {
+      overflowX: 'auto',
+      maxHeight: '500px',
+      overflowY: 'auto'
+    }
+  }, processes.length === 0 ? React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '32px',
+      color: '#8b949e'
+    }
+  }, "No process data found in taskinfo files") : React.createElement("table", {
+    style: {
+      width: '100%',
+      fontSize: '11px',
+      borderCollapse: 'collapse'
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      borderBottom: '1px solid #30363d',
+      position: 'sticky',
+      top: 0,
+      backgroundColor: '#0d1117',
+      zIndex: 1
+    }
+  }, pcols.map(c => React.createElement("th", {
+    key: c.key,
+    onClick: () => {
+      if (sortCol === c.key) setSortAsc(!sortAsc);else {
+        setSortCol(c.key);
+        setSortAsc(c.key === 'name');
+      }
+    },
+    style: {
+      padding: '6px 8px',
+      textAlign: 'left',
+      color: '#8b949e',
+      fontWeight: 500,
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+      userSelect: 'none'
+    }
+  }, c.label, sortCol === c.key ? sortAsc ? ' \u25B2' : ' \u25BC' : '')))), React.createElement("tbody", null, sorted.map((p, i) => React.createElement("tr", {
+    key: i,
+    style: {
+      borderBottom: '1px solid #21262d'
+    }
+  }, React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#e6edf3',
+      fontFamily: 'monospace'
+    }
+  }, p.name), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, p.pid), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#58a6ff',
+      fontFamily: 'monospace'
+    }
+  }, p.cpuTotal.toFixed(3)), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, p.cpuUser.toFixed(3)), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, p.cpuSystem.toFixed(3)), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#3fb950',
+      fontFamily: 'monospace'
+    }
+  }, formatBytes(p.residentMem)), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, formatBytes(p.virtualMem)), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, p.threads)))))), activeTab === 'cpu' && React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: Math.max(400, top20Cpu.length * 28) + 'px'
+    }
+  }, React.createElement("canvas", {
+    ref: cpuChartRef
+  })), activeTab === 'memory' && React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: Math.max(400, top20Mem.length * 28) + 'px'
+    }
+  }, React.createElement("canvas", {
+    ref: memChartRef
+  })), React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== NETWORKING DASHBOARD =====
+function NetworkDashboard({
+  files,
+  sectionFiles
+}) {
+  const [interfaces, setInterfaces] = useState([]);
+  const [connections, setConnections] = useState([]);
+  const [connFilter, setConnFilter] = useState('');
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [activeTab, setActiveTab] = useState('interfaces');
+  useEffect(() => {
+    const decoder = new TextDecoder('utf-8', {
+      fatal: false
+    });
+    const decode = f => {
+      const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+      return decoder.decode(buf);
+    };
+    const ifconfigFile = files.find(f => f.name.includes('ifconfig') && f.isFile && f.data);
+    if (ifconfigFile) {
+      const text = decode(ifconfigFile);
+      const blocks = text.split(/^(?=\S)/m).filter(b => b.trim());
+      const ifaces = [];
+      blocks.forEach(block => {
+        const lines = block.split('\n');
+        const hm = lines[0].match(/^(\S+):\s+flags=(\d+)<([^>]*)>/);
+        if (!hm) return;
+        const iface = {
+          name: hm[1],
+          flags: hm[3],
+          ips: [],
+          packets: {
+            rx: 0,
+            tx: 0
+          },
+          errors: {
+            rx: 0,
+            tx: 0
+          },
+          bytes: {
+            rx: 0,
+            tx: 0
+          }
+        };
+        lines.forEach(line => {
+          const im = line.match(/inet[6]?\s+(\S+)/);
+          if (im) iface.ips.push(im[1]);
+          const inM = line.match(/(\d+)\s+packets\s+input/);
+          if (inM) iface.packets.rx = parseInt(inM[1]);
+          const outM = line.match(/(\d+)\s+packets\s+output/);
+          if (outM) iface.packets.tx = parseInt(outM[1]);
+          const ieM = line.match(/(\d+)\s+input\s+errors/);
+          if (ieM) iface.errors.rx = parseInt(ieM[1]);
+          const oeM = line.match(/(\d+)\s+output\s+errors/);
+          if (oeM) iface.errors.tx = parseInt(oeM[1]);
+          const ibM = line.match(/(\d+)\s+bytes\s+input/);
+          if (ibM) iface.bytes.rx = parseInt(ibM[1]);
+          const obM = line.match(/(\d+)\s+bytes\s+output/);
+          if (obM) iface.bytes.tx = parseInt(obM[1]);
+        });
+        ifaces.push(iface);
+      });
+      setInterfaces(ifaces);
+    }
+    const netstatFile = files.find(f => f.name.includes('netstat') && f.isFile && f.data);
+    if (netstatFile) {
+      const text = decode(netstatFile);
+      const lines = text.split('\n');
+      const conns = [];
+      let started = false;
+      for (const line of lines) {
+        if (line.match(/^(Proto|Active)\s/i)) {
+          started = true;
+          continue;
+        }
+        if (!started || !line.trim()) continue;
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 4) {
+          const proto = parts[0];
+          if (['tcp', 'tcp4', 'tcp6', 'tcp46', 'udp', 'udp4', 'udp6', 'udp46'].includes(proto.toLowerCase())) {
+            conns.push({
+              proto,
+              local: parts[3] || '',
+              remote: parts[4] || '',
+              state: parts[5] || ''
+            });
+          }
+        }
+      }
+      setConnections(conns);
+    }
+  }, [files]);
+  const filteredConns = useMemo(() => {
+    if (!connFilter) return connections;
+    const f = connFilter.toLowerCase();
+    return connections.filter(c => c.proto.toLowerCase().includes(f) || c.local.toLowerCase().includes(f) || c.remote.toLowerCase().includes(f) || c.state.toLowerCase().includes(f));
+  }, [connections, connFilter]);
+  const activeIfaces = interfaces.filter(i => i.packets.rx > 0 || i.packets.tx > 0 || i.ips.length > 0);
+  const stateSummary = useMemo(() => {
+    const counts = {};
+    connections.forEach(c => {
+      const s = c.state || 'N/A';
+      counts[s] = (counts[s] || 0) + 1;
+    });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  }, [connections]);
+  return React.createElement("div", {
+    className: "dashboard-container"
+  }, React.createElement("div", {
+    className: "tab-bar"
+  }, ['interfaces', 'connections'].map(tab => React.createElement("div", {
+    key: tab,
+    className: "tab " + (activeTab === tab ? 'active' : ''),
+    onClick: () => setActiveTab(tab)
+  }, tab === 'interfaces' ? 'Interfaces (' + interfaces.length + ')' : 'Connections (' + connections.length + ')'))), activeTab === 'interfaces' && React.createElement("div", null, interfaces.length === 0 ? React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '32px',
+      color: '#8b949e'
+    }
+  }, "No interface data found") : React.createElement("div", null, activeIfaces.length > 0 && React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '16px'
+    }
+  }, activeIfaces.slice(0, 8).map(iface => React.createElement("div", {
+    key: iface.name,
+    style: {
+      padding: '10px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px',
+      minWidth: '180px',
+      flex: '1 1 200px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: '14px',
+      fontWeight: 600,
+      color: '#58a6ff',
+      marginBottom: '4px'
+    }
+  }, iface.name), iface.ips.map((ip, j) => React.createElement("div", {
+    key: j,
+    style: {
+      fontSize: '11px',
+      color: '#e6edf3',
+      fontFamily: 'monospace'
+    }
+  }, ip)), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: '12px',
+      marginTop: '6px',
+      fontSize: '11px'
+    }
+  }, React.createElement("span", {
+    style: {
+      color: '#3fb950'
+    }
+  }, "\u2191 " + formatBytes(iface.bytes.tx)), React.createElement("span", {
+    style: {
+      color: '#58a6ff'
+    }
+  }, "\u2193 " + formatBytes(iface.bytes.rx))), (iface.errors.rx > 0 || iface.errors.tx > 0) && React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#f85149',
+      marginTop: '4px'
+    }
+  }, "Errors: RX " + iface.errors.rx + " / TX " + iface.errors.tx)))), React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      fontSize: '11px',
+      borderCollapse: 'collapse'
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      borderBottom: '1px solid #30363d'
+    }
+  }, ['Interface', 'IPs', 'Flags', 'RX Pkts', 'TX Pkts', 'RX Bytes', 'TX Bytes', 'Errors'].map(h => React.createElement("th", {
+    key: h,
+    style: {
+      padding: '6px 8px',
+      textAlign: 'left',
+      color: '#8b949e',
+      fontWeight: 500,
+      whiteSpace: 'nowrap'
+    }
+  }, h)))), React.createElement("tbody", null, interfaces.map((iface, i) => React.createElement("tr", {
+    key: i,
+    style: {
+      borderBottom: '1px solid #21262d'
+    }
+  }, React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#58a6ff',
+      fontFamily: 'monospace',
+      fontWeight: 500
+    }
+  }, iface.name), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#e6edf3',
+      fontFamily: 'monospace',
+      fontSize: '10px'
+    }
+  }, iface.ips.join(', ') || '-'), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#8b949e',
+      fontSize: '10px',
+      maxWidth: '200px',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis'
+    }
+  }, iface.flags), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, iface.packets.rx.toLocaleString()), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, iface.packets.tx.toLocaleString()), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#3fb950',
+      fontFamily: 'monospace'
+    }
+  }, formatBytes(iface.bytes.rx)), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#3fb950',
+      fontFamily: 'monospace'
+    }
+  }, formatBytes(iface.bytes.tx)), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: iface.errors.rx + iface.errors.tx > 0 ? '#f85149' : '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, iface.errors.rx + iface.errors.tx > 0 ? iface.errors.rx + '/' + iface.errors.tx : '-')))))))), activeTab === 'connections' && React.createElement("div", null, connections.length === 0 ? React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '32px',
+      color: '#8b949e'
+    }
+  }, "No connection data found") : React.createElement("div", null, React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: '8px',
+      marginBottom: '12px',
+      flexWrap: 'wrap',
+      alignItems: 'center'
+    }
+  }, React.createElement("input", {
+    type: "text",
+    value: connFilter,
+    onChange: e => setConnFilter(e.target.value),
+    placeholder: "Filter by protocol, address, state...",
+    style: {
+      padding: '6px 10px',
+      backgroundColor: '#0d1117',
+      border: '1px solid #30363d',
+      borderRadius: '6px',
+      color: '#e6edf3',
+      fontSize: '12px',
+      flex: '1 1 200px',
+      maxWidth: '300px'
+    }
+  }), stateSummary.slice(0, 5).map(function (entry) {
+    return React.createElement("span", {
+      key: entry[0],
+      onClick: function () {
+        setConnFilter(entry[0]);
+      },
+      style: {
+        padding: '2px 8px',
+        borderRadius: '10px',
+        backgroundColor: '#21262d',
+        color: '#8b949e',
+        fontSize: '11px',
+        cursor: 'pointer'
+      }
+    }, entry[0] + ": " + entry[1]);
+  })), React.createElement("div", {
+    style: {
+      overflowX: 'auto',
+      maxHeight: '400px',
+      overflowY: 'auto'
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      fontSize: '11px',
+      borderCollapse: 'collapse'
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      borderBottom: '1px solid #30363d',
+      position: 'sticky',
+      top: 0,
+      backgroundColor: '#0d1117',
+      zIndex: 1
+    }
+  }, ['Protocol', 'Local Address', 'Remote Address', 'State'].map(h => React.createElement("th", {
+    key: h,
+    style: {
+      padding: '6px 8px',
+      textAlign: 'left',
+      color: '#8b949e',
+      fontWeight: 500
+    }
+  }, h)))), React.createElement("tbody", null, filteredConns.slice(0, 500).map((c, i) => React.createElement("tr", {
+    key: i,
+    style: {
+      borderBottom: '1px solid #21262d'
+    }
+  }, React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#bc8cff',
+      fontFamily: 'monospace'
+    }
+  }, c.proto), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#e6edf3',
+      fontFamily: 'monospace',
+      fontSize: '10px'
+    }
+  }, c.local), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: '#e6edf3',
+      fontFamily: 'monospace',
+      fontSize: '10px'
+    }
+  }, c.remote), React.createElement("td", {
+    style: {
+      padding: '4px 8px',
+      color: c.state === 'ESTABLISHED' ? '#3fb950' : c.state === 'LISTEN' ? '#58a6ff' : '#8b949e'
+    }
+  }, c.state)))))), filteredConns.length > 500 && React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e',
+      marginTop: '8px'
+    }
+  }, "Showing first 500 of " + filteredConns.length + " connections"))), React.createElement(CollapsibleFileList, {
     files: sectionFiles,
     selectedFile: selectedFile,
     setSelectedFile: setSelectedFile
@@ -4711,6 +6390,2333 @@ function DeviceHealthBanner({
     }
   }, f.detail))))))));
 }
+// ===== BATTERY DRAIN DASHBOARD (Per-App) =====
+function BatteryDrainDashboard({
+  files,
+  sectionFiles
+}) {
+  const [appUsage, setAppUsage] = useState([]);
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  useEffect(() => {
+    try {
+      const batteryFiles = files.filter(f => f.data && (f.name.includes('BatteryUI') || f.name.includes('BatteryLife')));
+      if (batteryFiles.length === 0) return;
+      const apps = [];
+      batteryFiles.forEach(f => {
+        try {
+          const decoder = new TextDecoder('utf-8', {
+            fatal: false
+          });
+          const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+          const text = decoder.decode(buf);
+          // Parse plist XML for app battery usage entries
+          const entryRegex = /<dict>([\s\S]*?)<\/dict>/g;
+          let match;
+          while ((match = entryRegex.exec(text)) !== null) {
+            const block = match[1];
+            const getVal = key => {
+              const m = block.match(new RegExp('<key>' + key + '</key>\\s*(?:<real>|<integer>|<string>)([^<]+)'));
+              return m ? m[1].trim() : '';
+            };
+            const name = getVal('BundleName') || getVal('Name') || getVal('Identifier') || getVal('BundleID');
+            const usage = parseFloat(getVal('Usage')) || parseFloat(getVal('Energy')) || parseFloat(getVal('BatteryUsage')) || 0;
+            const screenOn = parseFloat(getVal('ScreenOnTime') || getVal('ForegroundTime')) || 0;
+            const screenOff = parseFloat(getVal('ScreenOffTime') || getVal('BackgroundTime')) || 0;
+            if (name && usage > 0) {
+              apps.push({
+                name,
+                usage,
+                screenOn,
+                screenOff
+              });
+            }
+          }
+        } catch (e) {
+          console.warn('Failed to parse BatteryUI file:', f.name, e);
+        }
+      });
+      // Merge duplicates
+      const merged = {};
+      apps.forEach(a => {
+        if (!merged[a.name]) merged[a.name] = {
+          name: a.name,
+          usage: 0,
+          screenOn: 0,
+          screenOff: 0
+        };
+        merged[a.name].usage += a.usage;
+        merged[a.name].screenOn += a.screenOn;
+        merged[a.name].screenOff += a.screenOff;
+      });
+      const sorted = Object.values(merged).sort((a, b) => b.usage - a.usage).slice(0, 20);
+      setAppUsage(sorted);
+    } catch (e) {
+      console.error('Error parsing battery drain data:', e);
+    }
+  }, [files]);
+  useEffect(() => {
+    if (chartInstance.current) {
+      chartInstance.current.destroy();
+      chartInstance.current = null;
+    }
+    if (!chartRef.current || appUsage.length === 0) return;
+    const labels = appUsage.map(a => a.name);
+    const data = appUsage.map(a => a.usage);
+    const maxUsage = Math.max(...data);
+    chartInstance.current = new Chart(chartRef.current.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Battery Usage %',
+          data,
+          backgroundColor: data.map(v => v / maxUsage > 0.7 ? '#f85149' : v / maxUsage > 0.4 ? '#d29922' : '#58a6ff'),
+          borderColor: 'transparent',
+          borderWidth: 0,
+          borderRadius: 4
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: false
+          },
+          tooltip: {
+            callbacks: {
+              afterLabel: ctx => {
+                const app = appUsage[ctx.dataIndex];
+                const fmtTime = s => {
+                  if (!s) return '0s';
+                  const m = Math.floor(s / 60);
+                  const sec = Math.floor(s % 60);
+                  return m > 0 ? m + 'm ' + sec + 's' : sec + 's';
+                };
+                return 'Screen On: ' + fmtTime(app.screenOn) + '\nScreen Off: ' + fmtTime(app.screenOff);
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: {
+              color: '#30363d',
+              drawBorder: false
+            },
+            ticks: {
+              color: '#8b949e'
+            },
+            title: {
+              display: true,
+              text: 'Usage %',
+              color: '#8b949e'
+            }
+          },
+          y: {
+            grid: {
+              display: false
+            },
+            ticks: {
+              color: '#e6edf3',
+              font: {
+                size: 11
+              }
+            }
+          }
+        }
+      }
+    });
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+        chartInstance.current = null;
+      }
+    };
+  }, [appUsage]);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const fmtTime = s => {
+    if (!s) return '0s';
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return m > 0 ? m + 'm ' + sec + 's' : sec + 's';
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "dashboard-container"
+  }, appUsage.length > 0 ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: '14px',
+      fontWeight: 600,
+      color: '#e6edf3'
+    }
+  }, "Per-App Battery Usage"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: '11px',
+      color: '#484f58',
+      marginLeft: '12px'
+    }
+  }, appUsage.length, " apps")), /*#__PURE__*/React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: Math.max(250, appUsage.length * 28) + 'px'
+    }
+  }, /*#__PURE__*/React.createElement("canvas", {
+    ref: chartRef
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: '16px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '4px'
+    }
+  }, appUsage.map((a, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '10px',
+      fontSize: '12px',
+      padding: '4px 8px',
+      borderBottom: '1px solid #21262d'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      flex: '1 1 auto',
+      color: '#e6edf3',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, a.name), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#58a6ff',
+      fontWeight: 600,
+      minWidth: '50px',
+      textAlign: 'right'
+    }
+  }, a.usage.toFixed(1) + '%'), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#8b949e',
+      minWidth: '80px',
+      textAlign: 'right'
+    }
+  }, 'On: ' + fmtTime(a.screenOn)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      minWidth: '80px',
+      textAlign: 'right'
+    }
+  }, 'Off: ' + fmtTime(a.screenOff)))))) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '32px 16px',
+      color: '#6e7681'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '14px',
+      fontWeight: 500,
+      color: '#8b949e',
+      marginBottom: '4px'
+    }
+  }, "No per-app battery data found"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '12px'
+    }
+  }, "BatteryUI plist files were not found in this archive.")), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== BATTERY GAUGE DASHBOARD (IOService) =====
+function BatteryGaugeDashboard({
+  files,
+  sectionFiles
+}) {
+  const [gaugeData, setGaugeData] = useState(null);
+  const [selectedFile, setSelectedFile] = useState(null);
+  useEffect(() => {
+    try {
+      const ioFiles = files.filter(f => f.data && (f.name.includes('IOService') || f.name.includes('ioreg')));
+      if (ioFiles.length === 0) return;
+      let bestData = null;
+      ioFiles.forEach(f => {
+        try {
+          const decoder = new TextDecoder('utf-8', {
+            fatal: false
+          });
+          const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+          const text = decoder.decode(buf);
+          const extracted = {};
+          const grabInt = key => {
+            const m = text.match(new RegExp('"' + key + '"\\s*=\\s*(\\d+)'));
+            return m ? parseInt(m[1], 10) : null;
+          };
+          const grabStr = key => {
+            const m = text.match(new RegExp('"' + key + '"\\s*=\\s*"?([^"\\n}]+)"?'));
+            return m ? m[1].trim() : null;
+          };
+          extracted.Qmax = grabInt('Qmax');
+          extracted.CycleCount = grabInt('CycleCount');
+          extracted.DesignCapacity = grabInt('DesignCapacity');
+          extracted.NominalChargeCapacity = grabInt('NominalChargeCapacity');
+          extracted.LTQmaxUpdateCounter = grabInt('LTQmaxUpdateCounter');
+          extracted.Temperature = grabInt('Temperature');
+          extracted.Voltage = grabInt('Voltage');
+          extracted.InstantAmperage = grabInt('InstantAmperage');
+          extracted.FullyCharged = grabStr('FullyCharged');
+          extracted.IsCharging = grabStr('IsCharging');
+          extracted.ExternalConnected = grabStr('ExternalConnected');
+          // Ra tables - extract if present
+          const raMatch = text.match(/"Ra"[^{]*\{([^}]+)\}/);
+          if (raMatch) {
+            extracted.RaTable = raMatch[1].trim();
+          }
+          // Check if we got useful data
+          const hasData = Object.values(extracted).some(v => v !== null && v !== undefined);
+          if (hasData && (!bestData || extracted.Qmax !== null)) {
+            bestData = {
+              ...extracted,
+              source: f.name
+            };
+          }
+        } catch (e) {
+          console.warn('Failed to parse IOService file:', f.name, e);
+        }
+      });
+      if (bestData) setGaugeData(bestData);
+    } catch (e) {
+      console.error('Error parsing battery gauge data:', e);
+    }
+  }, [files]);
+  const metricCard = (label, value, unit, color) => {
+    if (value === null || value === undefined) return null;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        padding: '10px 14px',
+        backgroundColor: '#161b22',
+        border: '1px solid #30363d',
+        borderRadius: '8px',
+        minWidth: '140px'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: '11px',
+        color: '#8b949e',
+        marginBottom: '4px'
+      }
+    }, label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: '20px',
+        fontWeight: 600,
+        color: color || '#e6edf3'
+      }
+    }, typeof value === 'number' ? value.toLocaleString() : value, unit ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: '12px',
+        color: '#8b949e',
+        marginLeft: '4px'
+      }
+    }, unit) : null));
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "dashboard-container"
+  }, gaugeData ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: '14px',
+      fontWeight: 600,
+      color: '#e6edf3'
+    }
+  }, "Battery Gauge Parameters"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: '11px',
+      color: '#484f58',
+      marginLeft: '12px'
+    }
+  }, "from ", gaugeData.source)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '16px'
+    }
+  }, metricCard('Qmax', gaugeData.Qmax, 'mAh', '#58a6ff'), metricCard('Cycle Count', gaugeData.CycleCount, null, '#3fb950'), metricCard('Design Capacity', gaugeData.DesignCapacity, 'mAh', '#bc8cff'), metricCard('Nominal Charge', gaugeData.NominalChargeCapacity, 'mAh', '#d29922'), metricCard('LT Qmax Updates', gaugeData.LTQmaxUpdateCounter, null, '#f778ba'), metricCard('Temperature', gaugeData.Temperature !== null ? (gaugeData.Temperature / 100).toFixed(1) : null, '\u00B0C', '#f85149'), metricCard('Voltage', gaugeData.Voltage !== null ? (gaugeData.Voltage / 1000).toFixed(3) : null, 'V', '#58a6ff'), metricCard('Instant Amperage', gaugeData.InstantAmperage, 'mA', '#d29922')), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '16px'
+    }
+  }, gaugeData.FullyCharged !== null && metricCard('Fully Charged', gaugeData.FullyCharged, null, gaugeData.FullyCharged === 'Yes' ? '#3fb950' : '#8b949e'), gaugeData.IsCharging !== null && metricCard('Is Charging', gaugeData.IsCharging, null, gaugeData.IsCharging === 'Yes' ? '#3fb950' : '#8b949e'), gaugeData.ExternalConnected !== null && metricCard('External Connected', gaugeData.ExternalConnected, null, gaugeData.ExternalConnected === 'Yes' ? '#3fb950' : '#8b949e')), gaugeData.RaTable && /*#__PURE__*/React.createElement("div", {
+    style: chartPanelStyle
+  }, /*#__PURE__*/React.createElement("div", {
+    style: chartPanelHeaderStyle
+  }, /*#__PURE__*/React.createElement("span", null, "Ra Table")), /*#__PURE__*/React.createElement("pre", {
+    style: {
+      fontSize: '11px',
+      color: '#e6edf3',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-all',
+      margin: 0
+    }
+  }, gaugeData.RaTable)), gaugeData.NominalChargeCapacity && gaugeData.DesignCapacity && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...chartPanelStyle,
+      marginTop: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: chartPanelHeaderStyle
+  }, /*#__PURE__*/React.createElement("span", null, "Capacity Health")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      height: '12px',
+      backgroundColor: '#21262d',
+      borderRadius: '6px',
+      overflow: 'hidden'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: Math.min(100, gaugeData.NominalChargeCapacity / gaugeData.DesignCapacity * 100) + '%',
+      height: '100%',
+      backgroundColor: gaugeData.NominalChargeCapacity / gaugeData.DesignCapacity > 0.8 ? '#3fb950' : gaugeData.NominalChargeCapacity / gaugeData.DesignCapacity > 0.5 ? '#d29922' : '#f85149',
+      borderRadius: '6px'
+    }
+  })), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: '14px',
+      fontWeight: 600,
+      color: '#e6edf3',
+      minWidth: '50px'
+    }
+  }, (gaugeData.NominalChargeCapacity / gaugeData.DesignCapacity * 100).toFixed(1) + '%')))) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '32px 16px',
+      color: '#6e7681'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '14px',
+      fontWeight: 500,
+      color: '#8b949e',
+      marginBottom: '4px'
+    }
+  }, "No IOService battery gauge data found"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '12px'
+    }
+  }, "ioreg or IOService files were not found in this archive.")), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== CHARGING BEHAVIOR DASHBOARD =====
+function ChargingDashboard({
+  files,
+  sectionFiles
+}) {
+  const [chargingData, setChargingData] = useState([]);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  const mobile = useIsMobile();
+  const [timeRange, setTimeRange] = useState('all');
+  useEffect(() => {
+    try {
+      const obcFiles = files.filter(f => f.data && (f.name.includes('OBC') || f.name.includes('BDC')) && f.name.endsWith('.csv'));
+      if (obcFiles.length === 0) return;
+      let allRows = [];
+      obcFiles.forEach(f => {
+        try {
+          const decoder = new TextDecoder('utf-8', {
+            fatal: false
+          });
+          const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+          const text = decoder.decode(buf);
+          if (text) {
+            const rows = parseCSV(text);
+            allRows = allRows.concat(rows);
+          }
+        } catch (e) {
+          console.warn('Failed to parse OBC file:', f.name, e);
+        }
+      });
+      // Deduplicate by timestamp
+      const map = new Map();
+      allRows.forEach(row => {
+        if (row.TimeStamp) map.set(row.TimeStamp, row);
+      });
+      const sorted = Array.from(map.values()).sort((a, b) => new Date(a.TimeStamp) - new Date(b.TimeStamp));
+      setChargingData(sorted);
+    } catch (e) {
+      console.error('Error parsing charging data:', e);
+    }
+  }, [files]);
+  const TIME_RANGES = ['All', '1M', '2W', '1W'];
+  const filteredData = useMemo(() => filterByTimeRange(chargingData, timeRange, null), [chargingData, timeRange]);
+  useEffect(() => {
+    if (chartInstance.current) {
+      chartInstance.current.destroy();
+      chartInstance.current = null;
+    }
+    if (!chartRef.current || filteredData.length === 0) return;
+    try {
+      const datasets = [];
+      // Try common OBC column names
+      const colDefs = [{
+        col: 'SOC',
+        label: 'State of Charge',
+        color: '#58a6ff',
+        axis: 'y-left'
+      }, {
+        col: 'StateOfCharge',
+        label: 'State of Charge',
+        color: '#58a6ff',
+        axis: 'y-left'
+      }, {
+        col: 'Current',
+        label: 'Current (mA)',
+        color: '#3fb950',
+        axis: 'y-right'
+      }, {
+        col: 'Voltage',
+        label: 'Voltage (mV)',
+        color: '#d29922',
+        axis: 'y-right'
+      }, {
+        col: 'Temperature',
+        label: 'Temperature',
+        color: '#f85149',
+        axis: 'y-right'
+      }, {
+        col: 'ChargingCurrent',
+        label: 'Charging Current',
+        color: '#bc8cff',
+        axis: 'y-right'
+      }, {
+        col: 'ChargingVoltage',
+        label: 'Charging Voltage',
+        color: '#f778ba',
+        axis: 'y-right'
+      }];
+      colDefs.forEach(def => {
+        if (hasColumn(filteredData, def.col)) {
+          datasets.push({
+            label: def.label,
+            data: filteredData.map(row => ({
+              x: new Date(row.TimeStamp).getTime(),
+              y: parseFloat(row[def.col]) || null
+            })),
+            borderColor: def.color,
+            backgroundColor: 'transparent',
+            borderWidth: 2,
+            yAxisID: def.axis,
+            parsing: false,
+            tension: 0.1,
+            pointRadius: 0
+          });
+        }
+      });
+      if (datasets.length === 0) return;
+      chartInstance.current = new Chart(chartRef.current.getContext('2d'), {
+        type: 'line',
+        data: {
+          datasets
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {
+            intersect: false,
+            mode: 'index'
+          },
+          plugins: {
+            legend: {
+              labels: {
+                color: '#e6edf3',
+                usePointStyle: true,
+                padding: 16
+              }
+            },
+            zoom: chartZoomOptions
+          },
+          scales: {
+            x: {
+              type: 'time',
+              time: {
+                unit: 'day'
+              },
+              grid: {
+                color: '#30363d',
+                drawBorder: false
+              },
+              ticks: {
+                color: '#8b949e'
+              }
+            },
+            'y-left': {
+              type: 'linear',
+              position: 'left',
+              grid: {
+                color: '#30363d',
+                drawBorder: false
+              },
+              ticks: {
+                color: '#8b949e'
+              }
+            },
+            'y-right': {
+              type: 'linear',
+              position: 'right',
+              grid: {
+                drawOnChartArea: false,
+                drawBorder: false
+              },
+              ticks: {
+                color: '#8b949e'
+              }
+            }
+          }
+        }
+      });
+    } catch (e) {
+      console.error('ChargingDashboard chart error:', e);
+    }
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+        chartInstance.current = null;
+      }
+    };
+  }, [filteredData]);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "dashboard-container"
+  }, chargingData.length > 0 ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: getChartLayoutStyle(mobile)
+  }, /*#__PURE__*/React.createElement("div", {
+    style: getChartSidebarStyle(mobile)
+  }, /*#__PURE__*/React.createElement("div", {
+    style: chartPanelStyle
+  }, /*#__PURE__*/React.createElement("div", {
+    style: chartPanelHeaderStyle
+  }, /*#__PURE__*/React.createElement("span", null, "Time Range")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '4px'
+    }
+  }, TIME_RANGES.map(label => /*#__PURE__*/React.createElement("button", {
+    key: label,
+    className: 'time-button ' + (timeRange === label.toLowerCase() ? 'active' : ''),
+    onClick: () => setTimeRange(label.toLowerCase())
+  }, label))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: '14px',
+      fontWeight: 600,
+      color: '#e6edf3'
+    }
+  }, "Charging Curves Over Time"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: '11px',
+      color: '#484f58',
+      marginLeft: '12px'
+    }
+  }, filteredData.length, " data points \u00B7 Scroll to zoom \u00B7 drag to pan")), /*#__PURE__*/React.createElement("div", {
+    className: "chart-container"
+  }, /*#__PURE__*/React.createElement("canvas", {
+    ref: chartRef
+  }))))) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '32px 16px',
+      color: '#6e7681'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '14px',
+      fontWeight: 500,
+      color: '#8b949e',
+      marginBottom: '4px'
+    }
+  }, "No charging behavior data found"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '12px'
+    }
+  }, "BDC_OBC CSV files were not found in this archive.")), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== WIFI HISTORY DASHBOARD =====
+function WiFiDashboard({
+  files,
+  sectionFiles
+}) {
+  const [networks, setNetworks] = useState([]);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  const decoder = new TextDecoder('utf-8', {
+    fatal: false
+  });
+  const decode = f => {
+    const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+    return decoder.decode(buf);
+  };
+  useEffect(() => {
+    const wifiFiles = files.filter(f => f.isFile && f.data && (/wifi/i.test(f.name) || /wireless/i.test(f.name)));
+    const nets = [];
+    const seen = new Set();
+    wifiFiles.forEach(f => {
+      try {
+        const text = decode(f);
+        const ssidMatches = text.matchAll(/<key>SSID_STR<\/key>\s*<string>([^<]+)<\/string>/gi);
+        for (const m of ssidMatches) {
+          const ssid = m[1];
+          if (!seen.has(ssid)) {
+            seen.add(ssid);
+            const secMatch = text.match(new RegExp(ssid + '[\\s\\S]{0,500}?<key>WPA[^<]*<\\/key>', 'i'));
+            const secType = secMatch ? 'WPA' : 'Unknown';
+            const dateMatch = text.match(new RegExp(ssid + '[\\s\\S]{0,1000}?<key>lastJoined<\\/key>\\s*<date>([^<]+)<\\/date>', 'i'));
+            const lastConnected = dateMatch ? dateMatch[1] : '';
+            nets.push({
+              ssid,
+              securityType: secType,
+              lastConnected,
+              source: f.name
+            });
+          }
+        }
+        const lines = text.split('\n');
+        lines.forEach(line => {
+          const parts = line.split(/[,\t]/);
+          if (parts.length >= 2) {
+            const candidate = parts[0].trim();
+            if (candidate && candidate.length > 1 && candidate.length < 64 && !candidate.startsWith('#') && !candidate.startsWith('<') && !seen.has(candidate)) {
+              const hasSignal = parts.some(p => /^-?\d+\s*d?B?m?$/i.test(p.trim()));
+              if (hasSignal) {
+                seen.add(candidate);
+                const signal = parts.find(p => /^-?\d+/.test(p.trim()));
+                nets.push({
+                  ssid: candidate,
+                  securityType: 'N/A',
+                  lastConnected: '',
+                  signalStrength: parseInt(signal) || 0,
+                  source: f.name
+                });
+              }
+            }
+          }
+        });
+      } catch (e) {/* skip */}
+    });
+    if (nets.length === 0) {
+      wifiFiles.forEach(f => {
+        try {
+          const text = decode(f);
+          const ssidPattern = /(?:SSID|ssid|network)[:\s=]+["']?([A-Za-z0-9_\-\s]{2,32})["']?/gi;
+          let m;
+          while ((m = ssidPattern.exec(text)) !== null) {
+            const ssid = m[1].trim();
+            if (!seen.has(ssid)) {
+              seen.add(ssid);
+              nets.push({
+                ssid,
+                securityType: 'N/A',
+                lastConnected: '',
+                source: f.name
+              });
+            }
+          }
+        } catch (e) {/* skip */}
+      });
+    }
+    setNetworks(nets.sort((a, b) => (b.lastConnected || '').localeCompare(a.lastConnected || '')));
+  }, [files]);
+  useEffect(() => {
+    if (chartInstance.current) {
+      chartInstance.current.destroy();
+      chartInstance.current = null;
+    }
+    if (!chartRef.current) return;
+    const withSignal = networks.filter(n => n.signalStrength);
+    if (withSignal.length === 0) return;
+    const sorted = withSignal.sort((a, b) => b.signalStrength - a.signalStrength).slice(0, 15);
+    chartInstance.current = new Chart(chartRef.current.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: sorted.map(n => n.ssid),
+        datasets: [{
+          label: 'Signal (dBm)',
+          data: sorted.map(n => n.signalStrength),
+          backgroundColor: sorted.map(n => n.signalStrength > -50 ? '#3fb950' : n.signalStrength > -70 ? '#d29922' : '#f85149'),
+          borderRadius: 4
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: false
+          }
+        },
+        scales: {
+          x: {
+            grid: {
+              color: '#30363d'
+            },
+            ticks: {
+              color: '#8b949e',
+              callback: v => v + ' dBm'
+            }
+          },
+          y: {
+            grid: {
+              display: false
+            },
+            ticks: {
+              color: '#e6edf3',
+              font: {
+                size: 11
+              }
+            }
+          }
+        }
+      }
+    });
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+        chartInstance.current = null;
+      }
+    };
+  }, [networks]);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "dashboard-container"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Known Networks"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#58a6ff'
+    }
+  }, networks.length))), networks.some(n => n.signalStrength) && /*#__PURE__*/React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: '250px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("canvas", {
+    ref: chartRef
+  })), networks.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: '100%',
+      fontSize: '12px',
+      borderCollapse: 'collapse'
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      borderBottom: '1px solid #30363d'
+    }
+  }, ['SSID', 'Security', 'Last Connected', 'Source'].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      padding: '6px 8px',
+      textAlign: 'left',
+      color: '#8b949e',
+      fontWeight: 500
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, networks.map((n, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i,
+    style: {
+      borderBottom: '1px solid #21262d'
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px',
+      color: '#e6edf3',
+      fontFamily: 'monospace'
+    }
+  }, n.ssid), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px',
+      color: '#8b949e'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      padding: '1px 6px',
+      borderRadius: '8px',
+      backgroundColor: '#21262d',
+      fontSize: '11px'
+    }
+  }, n.securityType)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px',
+      color: '#8b949e',
+      fontSize: '11px'
+    }
+  }, n.lastConnected || 'N/A'), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px',
+      color: '#6e7681',
+      fontSize: '11px',
+      fontFamily: 'monospace'
+    }
+  }, n.source.split('/').pop())))))), networks.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '24px',
+      color: '#6e7681',
+      fontSize: '13px'
+    }
+  }, "No WiFi network data could be parsed from the available files."), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== JETSAM DEEP DIVE DASHBOARD =====
+function JetsamDashboard({
+  files,
+  sectionFiles
+}) {
+  const [events, setEvents] = useState([]);
+  const [killedProcesses, setKilledProcesses] = useState([]);
+  const [activeTab, setActiveTab] = useState('summary');
+  const [selectedFile, setSelectedFile] = useState(null);
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  const timelineRef = useRef(null);
+  const timelineInstance = useRef(null);
+  const decoder = new TextDecoder('utf-8', {
+    fatal: false
+  });
+  const decode = f => {
+    const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+    return decoder.decode(buf);
+  };
+  useEffect(() => {
+    const jetsamFiles = files.filter(f => f.isFile && f.data && /JetsamEvent/i.test(f.name) && f.name.endsWith('.ips'));
+    const allEvents = [];
+    const allKilled = [];
+    jetsamFiles.forEach(f => {
+      try {
+        const text = decode(f);
+        let jsonStr = text;
+        const braceIdx = text.indexOf('{');
+        if (braceIdx > 0) jsonStr = text.substring(braceIdx);
+        const data = JSON.parse(jsonStr);
+        const timestamp = data.timestamp || data.date || f.name.match(/(\d{4}-\d{2}-\d{2})/)?.[1] || '';
+        const reason = data.event || data.reason || 'memory pressure';
+        const pageSize = data.pageSize || 16384;
+        allEvents.push({
+          timestamp,
+          reason,
+          source: f.name
+        });
+        const procs = data.largestProcesses || data.processes || [];
+        procs.forEach(p => {
+          const name = p.name || p.processName || 'unknown';
+          const rpages = p.rpages || p.residentPages || 0;
+          const memBytes = rpages * pageSize;
+          const limit = (p.memoryLimit || p.footprintLimit || 0) * pageSize;
+          allKilled.push({
+            name,
+            reason: p.reason || p.state || '',
+            memoryUsage: memBytes,
+            memoryLimit: limit,
+            timestamp,
+            source: f.name
+          });
+        });
+      } catch (e) {
+        try {
+          const text = decode(f);
+          text.split('\n').forEach(line => {
+            try {
+              if (line.trim().startsWith('{')) {
+                const obj = JSON.parse(line);
+                if (obj.largestProcesses || obj.processes) {
+                  (obj.largestProcesses || obj.processes || []).forEach(p => {
+                    allKilled.push({
+                      name: p.name || 'unknown',
+                      reason: p.reason || p.state || '',
+                      memoryUsage: (p.rpages || 0) * 16384,
+                      memoryLimit: (p.memoryLimit || 0) * 16384,
+                      timestamp: obj.timestamp || '',
+                      source: f.name
+                    });
+                  });
+                }
+              }
+            } catch (e2) {/* skip */}
+          });
+        } catch (e2) {/* skip */}
+      }
+    });
+    setEvents(allEvents.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || '')));
+    setKilledProcesses(allKilled.sort((a, b) => b.memoryUsage - a.memoryUsage));
+  }, [files]);
+  useEffect(() => {
+    if (chartInstance.current) {
+      chartInstance.current.destroy();
+      chartInstance.current = null;
+    }
+    if (!chartRef.current || killedProcesses.length === 0 || activeTab !== 'summary') return;
+    const procMap = {};
+    killedProcesses.forEach(p => {
+      if (!procMap[p.name]) procMap[p.name] = {
+        totalMem: 0,
+        count: 0
+      };
+      procMap[p.name].totalMem += p.memoryUsage;
+      procMap[p.name].count += 1;
+    });
+    const top = Object.entries(procMap).sort((a, b) => b[1].totalMem - a[1].totalMem).slice(0, 12);
+    const colors = ['#f85149', '#d29922', '#58a6ff', '#3fb950', '#bc8cff', '#f778ba', '#6e7681', '#e6edf3', '#8b949e', '#388bfd', '#56d364', '#db6d28'];
+    chartInstance.current = new Chart(chartRef.current.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: top.map(([name]) => name.length > 20 ? name.slice(0, 18) + '..' : name),
+        datasets: [{
+          label: 'Total Memory',
+          data: top.map(([, v]) => v.totalMem),
+          backgroundColor: colors.slice(0, top.length),
+          borderRadius: 4
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: false
+          },
+          tooltip: {
+            callbacks: {
+              label: ctx => formatBytes(ctx.raw)
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: {
+              color: '#30363d'
+            },
+            ticks: {
+              color: '#8b949e',
+              callback: v => formatBytes(v)
+            }
+          },
+          y: {
+            grid: {
+              display: false
+            },
+            ticks: {
+              color: '#e6edf3',
+              font: {
+                size: 11
+              }
+            }
+          }
+        }
+      }
+    });
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+        chartInstance.current = null;
+      }
+    };
+  }, [killedProcesses, activeTab]);
+  useEffect(() => {
+    if (timelineInstance.current) {
+      timelineInstance.current.destroy();
+      timelineInstance.current = null;
+    }
+    if (!timelineRef.current || events.length === 0 || activeTab !== 'timeline') return;
+    const dateCounts = {};
+    events.filter(e => e.timestamp).forEach(e => {
+      const day = (e.timestamp || '').slice(0, 10);
+      dateCounts[day] = (dateCounts[day] || 0) + 1;
+    });
+    const labels = Object.keys(dateCounts).sort();
+    if (labels.length === 0) return;
+    timelineInstance.current = new Chart(timelineRef.current.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Jetsam Events',
+          data: labels.map(l => dateCounts[l]),
+          backgroundColor: '#f8514988',
+          borderColor: '#f85149',
+          borderWidth: 1,
+          borderRadius: 4
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: false
+          }
+        },
+        scales: {
+          x: {
+            grid: {
+              display: false
+            },
+            ticks: {
+              color: '#8b949e',
+              maxRotation: 45,
+              font: {
+                size: 10
+              }
+            }
+          },
+          y: {
+            grid: {
+              color: '#30363d'
+            },
+            ticks: {
+              color: '#8b949e',
+              stepSize: 1
+            },
+            beginAtZero: true
+          }
+        }
+      }
+    });
+    return () => {
+      if (timelineInstance.current) {
+        timelineInstance.current.destroy();
+        timelineInstance.current = null;
+      }
+    };
+  }, [events, activeTab]);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "dashboard-container"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "tab-bar"
+  }, ['summary', 'timeline', 'processes'].map(tab => /*#__PURE__*/React.createElement("div", {
+    key: tab,
+    className: `tab ${activeTab === tab ? 'active' : ''}`,
+    onClick: () => setActiveTab(tab)
+  }, tab === 'summary' ? 'Summary' : tab === 'timeline' ? 'Event Timeline' : 'Killed Processes'))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Jetsam Events"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#f85149'
+    }
+  }, events.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Processes Affected"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#d29922'
+    }
+  }, new Set(killedProcesses.map(p => p.name)).size)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Total Terminations"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#e6edf3'
+    }
+  }, killedProcesses.length))), activeTab === 'summary' && killedProcesses.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: Math.max(200, Math.min(12, new Set(killedProcesses.map(p => p.name)).size) * 28) + 'px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("canvas", {
+    ref: chartRef
+  })), activeTab === 'timeline' && /*#__PURE__*/React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: '250px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("canvas", {
+    ref: timelineRef
+  })), activeTab === 'processes' && /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: 'auto',
+      maxHeight: '500px',
+      overflowY: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: '100%',
+      fontSize: '12px',
+      borderCollapse: 'collapse'
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      borderBottom: '1px solid #30363d',
+      position: 'sticky',
+      top: 0,
+      backgroundColor: '#0d1117'
+    }
+  }, ['Process', 'Reason', 'Memory Usage', 'Memory Limit', 'Timestamp'].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      padding: '6px 8px',
+      textAlign: 'left',
+      color: '#8b949e',
+      fontWeight: 500
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, killedProcesses.slice(0, 100).map((p, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i,
+    style: {
+      borderBottom: '1px solid #21262d'
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px',
+      color: '#e6edf3',
+      fontFamily: 'monospace'
+    }
+  }, p.name), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      padding: '1px 6px',
+      borderRadius: '8px',
+      backgroundColor: '#f8514922',
+      color: '#f85149',
+      fontSize: '11px'
+    }
+  }, p.reason || 'killed')), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px',
+      color: p.memoryUsage > 500 * 1024 * 1024 ? '#f85149' : '#e6edf3',
+      fontFamily: 'monospace'
+    }
+  }, formatBytes(p.memoryUsage)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px',
+      color: '#8b949e',
+      fontFamily: 'monospace'
+    }
+  }, p.memoryLimit ? formatBytes(p.memoryLimit) : 'N/A'), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '6px 8px',
+      color: '#8b949e',
+      fontSize: '11px'
+    }
+  }, p.timestamp)))))), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== THERMAL DASHBOARD =====
+function ThermalDashboard({
+  files,
+  sectionFiles
+}) {
+  const [thermalEvents, setThermalEvents] = useState([]);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  const decoder = new TextDecoder('utf-8', {
+    fatal: false
+  });
+  const decode = f => {
+    const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+    return decoder.decode(buf);
+  };
+  useEffect(() => {
+    const thermalFiles = files.filter(f => f.isFile && f.data && /thermal/i.test(f.name));
+    const events = [];
+    thermalFiles.forEach(f => {
+      try {
+        const text = decode(f);
+        const statePattern = /(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})[^\n]*?thermal[^\n]*?(nominal|fair|serious|critical|light|moderate|heavy|trapping)/gi;
+        let m;
+        while ((m = statePattern.exec(text)) !== null) {
+          events.push({
+            timestamp: m[1],
+            state: m[2].toLowerCase(),
+            source: f.name
+          });
+        }
+        const tempPattern = /(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})[^\n]*?(\d{2,3}(?:\.\d+)?)\s*(?:C|degrees|celsius)/gi;
+        while ((m = tempPattern.exec(text)) !== null) {
+          const temp = parseFloat(m[2]);
+          if (temp > 20 && temp < 120) events.push({
+            timestamp: m[1],
+            temperature: temp,
+            source: f.name
+          });
+        }
+        const lines = text.split('\n');
+        if (lines.length > 1 && /thermal|temp/i.test(lines[0])) {
+          const headers = lines[0].split(/[,\t]/);
+          const tempIdx = headers.findIndex(h => /temp|thermal|celsius/i.test(h));
+          const timeIdx = headers.findIndex(h => /time|date|timestamp/i.test(h));
+          if (tempIdx >= 0) {
+            lines.slice(1).forEach(line => {
+              const cols = line.split(/[,\t]/);
+              const temp = parseFloat(cols[tempIdx]);
+              if (temp > 20 && temp < 120) events.push({
+                timestamp: timeIdx >= 0 ? cols[timeIdx] : '',
+                temperature: temp,
+                source: f.name
+              });
+            });
+          }
+        }
+      } catch (e) {/* skip */}
+    });
+    const plsqlFile = files.find(f => f.isFile && f.data && f.name.endsWith('.plsql'));
+    if (plsqlFile) {
+      try {
+        getSqlJs().then(SQL => {
+          try {
+            const buf = plsqlFile.data instanceof ArrayBuffer ? new Uint8Array(plsqlFile.data) : plsqlFile.data;
+            const db = new SQL.Database(buf);
+            const tables = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%thermal%'");
+            if (tables.length > 0 && tables[0].values.length > 0) {
+              tables[0].values.forEach(([tableName]) => {
+                try {
+                  const result = db.exec(`SELECT * FROM "${tableName}" LIMIT 500`);
+                  if (result.length > 0) {
+                    const cols = result[0].columns;
+                    const tempCol = cols.findIndex(c => /temp|thermal|celsius/i.test(c));
+                    const timeCol = cols.findIndex(c => /time|date|timestamp/i.test(c));
+                    const stateCol = cols.findIndex(c => /state|level|pressure/i.test(c));
+                    result[0].values.forEach(row => {
+                      const evt = {
+                        source: tableName
+                      };
+                      if (timeCol >= 0) evt.timestamp = String(row[timeCol]);
+                      if (tempCol >= 0) {
+                        const t = parseFloat(row[tempCol]);
+                        if (t > 20 && t < 120) evt.temperature = t;
+                      }
+                      if (stateCol >= 0) evt.state = String(row[stateCol]).toLowerCase();
+                      if (evt.temperature || evt.state) events.push(evt);
+                    });
+                    setThermalEvents([...events].sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || '')));
+                  }
+                } catch (e2) {/* skip */}
+              });
+            }
+            db.close();
+          } catch (e) {/* skip */}
+        });
+      } catch (e) {/* skip */}
+    }
+    setThermalEvents(events.sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || '')));
+  }, [files]);
+  useEffect(() => {
+    if (chartInstance.current) {
+      chartInstance.current.destroy();
+      chartInstance.current = null;
+    }
+    if (!chartRef.current || thermalEvents.length === 0) return;
+    const withTemp = thermalEvents.filter(e => e.temperature && e.timestamp);
+    const withState = thermalEvents.filter(e => e.state && e.timestamp);
+    if (withTemp.length > 0) {
+      chartInstance.current = new Chart(chartRef.current.getContext('2d'), {
+        type: 'line',
+        data: {
+          labels: withTemp.map(e => e.timestamp),
+          datasets: [{
+            label: 'Temperature (\u00B0C)',
+            data: withTemp.map(e => e.temperature),
+            borderColor: '#f85149',
+            backgroundColor: '#f8514922',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              labels: {
+                color: '#e6edf3'
+              }
+            },
+            ...chartZoomOptions.plugins
+          },
+          scales: {
+            x: {
+              grid: {
+                color: '#30363d'
+              },
+              ticks: {
+                color: '#8b949e',
+                maxTicksLimit: 10,
+                maxRotation: 45,
+                font: {
+                  size: 10
+                }
+              }
+            },
+            y: {
+              grid: {
+                color: '#30363d'
+              },
+              ticks: {
+                color: '#8b949e',
+                callback: v => v + '\u00B0C'
+              }
+            }
+          }
+        }
+      });
+    } else if (withState.length > 0) {
+      const stateMap = {
+        nominal: 0,
+        light: 1,
+        fair: 1,
+        moderate: 2,
+        serious: 3,
+        heavy: 3,
+        critical: 4,
+        trapping: 4
+      };
+      const stateColors = {
+        0: '#3fb950',
+        1: '#58a6ff',
+        2: '#d29922',
+        3: '#f85149',
+        4: '#ff0000'
+      };
+      chartInstance.current = new Chart(chartRef.current.getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels: withState.map(e => e.timestamp),
+          datasets: [{
+            label: 'Thermal State',
+            data: withState.map(e => stateMap[e.state] ?? 0),
+            backgroundColor: withState.map(e => stateColors[stateMap[e.state] ?? 0] + '88'),
+            borderColor: withState.map(e => stateColors[stateMap[e.state] ?? 0]),
+            borderWidth: 1,
+            borderRadius: 2
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              display: false
+            },
+            tooltip: {
+              callbacks: {
+                label: ctx => withState[ctx.dataIndex]?.state || ''
+              }
+            }
+          },
+          scales: {
+            x: {
+              grid: {
+                display: false
+              },
+              ticks: {
+                color: '#8b949e',
+                maxTicksLimit: 10,
+                maxRotation: 45,
+                font: {
+                  size: 10
+                }
+              }
+            },
+            y: {
+              grid: {
+                color: '#30363d'
+              },
+              min: 0,
+              max: 4,
+              ticks: {
+                color: '#8b949e',
+                stepSize: 1,
+                callback: v => ['Nominal', 'Fair', 'Moderate', 'Serious', 'Critical'][v] || ''
+              }
+            }
+          }
+        }
+      });
+    }
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+        chartInstance.current = null;
+      }
+    };
+  }, [thermalEvents]);
+  const stateCounts = {};
+  thermalEvents.filter(e => e.state).forEach(e => {
+    stateCounts[e.state] = (stateCounts[e.state] || 0) + 1;
+  });
+  const stateColorMap = {
+    nominal: '#3fb950',
+    fair: '#58a6ff',
+    light: '#58a6ff',
+    moderate: '#d29922',
+    serious: '#f85149',
+    heavy: '#f85149',
+    critical: '#ff0000',
+    trapping: '#ff0000'
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "dashboard-container"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Thermal Events"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#e6edf3'
+    }
+  }, thermalEvents.length)), Object.entries(stateCounts).sort((a, b) => b[1] - a[1]).map(([state, count]) => /*#__PURE__*/React.createElement("div", {
+    key: state,
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e',
+      textTransform: 'capitalize'
+    }
+  }, state), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '16px',
+      fontWeight: 600,
+      color: stateColorMap[state] || '#e6edf3'
+    }
+  }, count)))), thermalEvents.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: '280px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("canvas", {
+    ref: chartRef
+  })), thermalEvents.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: '300px',
+      overflowY: 'auto'
+    }
+  }, thermalEvents.slice(0, 100).map((e, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '12px',
+      padding: '6px 10px',
+      borderBottom: '1px solid #21262d',
+      fontSize: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#8b949e',
+      fontSize: '11px',
+      minWidth: '140px'
+    }
+  }, e.timestamp || 'N/A'), e.state && /*#__PURE__*/React.createElement("span", {
+    style: {
+      padding: '1px 8px',
+      borderRadius: '8px',
+      fontSize: '11px',
+      fontWeight: 600,
+      backgroundColor: (stateColorMap[e.state] || '#8b949e') + '22',
+      color: stateColorMap[e.state] || '#8b949e',
+      textTransform: 'capitalize'
+    }
+  }, e.state), e.temperature && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: e.temperature > 80 ? '#f85149' : e.temperature > 60 ? '#d29922' : '#e6edf3',
+      fontFamily: 'monospace'
+    }
+  }, e.temperature.toFixed(1) + '\u00B0C'), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      fontSize: '11px',
+      marginLeft: 'auto'
+    }
+  }, e.source.split('/').pop())))), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== SECURITY OVERVIEW DASHBOARD =====
+function SecurityDashboard({
+  files,
+  sectionFiles
+}) {
+  const [securityInfo, setSecurityInfo] = useState({
+    profiles: [],
+    certificates: [],
+    codeSigning: [],
+    general: []
+  });
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [activeTab, setActiveTab] = useState('overview');
+  const decoder = new TextDecoder('utf-8', {
+    fatal: false
+  });
+  const decode = f => {
+    const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+    return decoder.decode(buf);
+  };
+  useEffect(() => {
+    const secFiles = files.filter(f => f.isFile && f.data && (/security/i.test(f.name) || /ckks/i.test(f.name) || /otctl/i.test(f.name) || /pcsstatus/i.test(f.name) || /transparency/i.test(f.name)));
+    const info = {
+      profiles: [],
+      certificates: [],
+      codeSigning: [],
+      general: []
+    };
+    secFiles.forEach(f => {
+      try {
+        const text = decode(f);
+        if (/security/i.test(f.name)) {
+          const profilePattern = /(?:profile|Profile)[:\s]+([^\n]+)/gi;
+          let m;
+          while ((m = profilePattern.exec(text)) !== null) info.profiles.push({
+            name: m[1].trim(),
+            source: f.name
+          });
+          const certPattern = /(?:certificate|cert|Certificate)[:\s]+["']?([^\n"']+)/gi;
+          while ((m = certPattern.exec(text)) !== null) info.certificates.push({
+            name: m[1].trim(),
+            source: f.name
+          });
+          const csPattern = /(?:codesign|code.signing|signature)[:\s]+([^\n]+)/gi;
+          while ((m = csPattern.exec(text)) !== null) info.codeSigning.push({
+            status: m[1].trim(),
+            source: f.name
+          });
+          text.split('\n').filter(l => l.trim().length > 0).slice(0, 50).forEach(line => {
+            if (line.trim() && !line.startsWith('#')) info.general.push({
+              text: line.trim(),
+              source: f.name
+            });
+          });
+        }
+        if (/ckks/i.test(f.name)) {
+          text.split('\n').filter(l => l.trim()).forEach(line => {
+            if (/view|zone|status|sync/i.test(line)) info.general.push({
+              text: line.trim(),
+              source: f.name,
+              category: 'CKKS'
+            });
+          });
+        }
+        if (/otctl/i.test(f.name)) {
+          text.split('\n').filter(l => l.trim()).forEach(line => {
+            info.general.push({
+              text: line.trim(),
+              source: f.name,
+              category: 'Octagon Trust'
+            });
+          });
+        }
+      } catch (e) {/* skip */}
+    });
+    setSecurityInfo(info);
+  }, [files]);
+  const totalItems = securityInfo.profiles.length + securityInfo.certificates.length + securityInfo.codeSigning.length;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "dashboard-container"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "tab-bar"
+  }, ['overview', 'details'].map(tab => /*#__PURE__*/React.createElement("div", {
+    key: tab,
+    className: `tab ${activeTab === tab ? 'active' : ''}`,
+    onClick: () => setActiveTab(tab)
+  }, tab === 'overview' ? 'Overview' : 'Raw Details'))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Profiles"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#58a6ff'
+    }
+  }, securityInfo.profiles.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Certificates"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#3fb950'
+    }
+  }, securityInfo.certificates.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Code Signing"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#d29922'
+    }
+  }, securityInfo.codeSigning.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Security Files"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#e6edf3'
+    }
+  }, sectionFiles.length))), activeTab === 'overview' && /*#__PURE__*/React.createElement(React.Fragment, null, securityInfo.profiles.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      fontWeight: 600,
+      color: '#e6edf3',
+      marginBottom: '8px'
+    }
+  }, "Installed Profiles"), securityInfo.profiles.map((p, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      gap: '8px',
+      padding: '6px 10px',
+      borderBottom: '1px solid #21262d',
+      fontSize: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#58a6ff'
+    }
+  }, p.name), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      marginLeft: 'auto',
+      fontSize: '11px'
+    }
+  }, p.source.split('/').pop())))), securityInfo.certificates.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      fontWeight: 600,
+      color: '#e6edf3',
+      marginBottom: '8px'
+    }
+  }, "Certificates"), securityInfo.certificates.map((c, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      gap: '8px',
+      padding: '6px 10px',
+      borderBottom: '1px solid #21262d',
+      fontSize: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#3fb950'
+    }
+  }, c.name), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      marginLeft: 'auto',
+      fontSize: '11px'
+    }
+  }, c.source.split('/').pop())))), securityInfo.codeSigning.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      fontWeight: 600,
+      color: '#e6edf3',
+      marginBottom: '8px'
+    }
+  }, "Code Signing Status"), securityInfo.codeSigning.map((cs, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      padding: '6px 10px',
+      borderBottom: '1px solid #21262d',
+      fontSize: '12px',
+      color: /valid|pass/i.test(cs.status) ? '#3fb950' : '#d29922'
+    }
+  }, cs.status))), totalItems === 0 && securityInfo.general.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: '400px',
+      overflowY: 'auto'
+    }
+  }, securityInfo.general.slice(0, 50).map((g, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      gap: '8px',
+      padding: '4px 10px',
+      borderBottom: '1px solid #21262d',
+      fontSize: '12px'
+    }
+  }, g.category && /*#__PURE__*/React.createElement("span", {
+    style: {
+      padding: '1px 6px',
+      borderRadius: '8px',
+      backgroundColor: '#21262d',
+      color: '#8b949e',
+      fontSize: '11px',
+      flexShrink: 0
+    }
+  }, g.category), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#e6edf3',
+      fontFamily: 'monospace',
+      fontSize: '11px'
+    }
+  }, g.text))))), activeTab === 'details' && /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: '500px',
+      overflowY: 'auto'
+    }
+  }, securityInfo.general.map((g, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      gap: '8px',
+      padding: '4px 10px',
+      borderBottom: '1px solid #21262d',
+      fontSize: '12px'
+    }
+  }, g.category && /*#__PURE__*/React.createElement("span", {
+    style: {
+      padding: '1px 6px',
+      borderRadius: '8px',
+      backgroundColor: '#21262d',
+      color: '#8b949e',
+      fontSize: '11px',
+      flexShrink: 0
+    }
+  }, g.category), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#e6edf3',
+      fontFamily: 'monospace',
+      fontSize: '11px',
+      wordBreak: 'break-all'
+    }
+  }, g.text), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      fontSize: '10px',
+      marginLeft: 'auto',
+      flexShrink: 0
+    }
+  }, g.source.split('/').pop())))), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
+
+// ===== SOFTWARE UPDATE HISTORY DASHBOARD =====
+function UpdateHistoryDashboard({
+  files,
+  sectionFiles
+}) {
+  const [updates, setUpdates] = useState([]);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+  const decoder = new TextDecoder('utf-8', {
+    fatal: false
+  });
+  const decode = f => {
+    const buf = f.data instanceof ArrayBuffer ? new Uint8Array(f.data) : f.data;
+    return decoder.decode(buf);
+  };
+  useEffect(() => {
+    const updateFiles = files.filter(f => f.isFile && f.data && (/update/i.test(f.name) || /MobileSoftwareUpdate/i.test(f.name) || /OTAUpdate/i.test(f.name) || /StagingLogs/i.test(f.name)));
+    const allUpdates = [];
+    const seen = new Set();
+    updateFiles.forEach(f => {
+      try {
+        const text = decode(f);
+        const versionPattern = /(?:iOS|iPadOS|version|Version|build|Build)[:\s]*(\d+\.\d+(?:\.\d+)?)\s*(?:\((\w+)\))?/gi;
+        let m;
+        while ((m = versionPattern.exec(text)) !== null) {
+          const version = m[1];
+          const build = m[2] || '';
+          const key = version + build;
+          if (!seen.has(key)) {
+            seen.add(key);
+            const context = text.substring(Math.max(0, m.index - 200), m.index + 200);
+            const dateMatch = context.match(/(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})/);
+            allUpdates.push({
+              version,
+              build,
+              date: dateMatch ? dateMatch[1] : '',
+              source: f.name,
+              status: 'detected'
+            });
+          }
+        }
+        const attemptPattern = /(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})[^\n]*?(update|download|install|upgrade)[^\n]*?(success|succeed|fail|error|complete|abort|cancel)/gi;
+        while ((m = attemptPattern.exec(text)) !== null) {
+          const status = /fail|error|abort|cancel/i.test(m[3]) ? 'failed' : 'success';
+          allUpdates.push({
+            version: '',
+            build: '',
+            date: m[1],
+            source: f.name,
+            status,
+            action: m[2].toLowerCase()
+          });
+        }
+      } catch (e) {/* skip */}
+    });
+    setUpdates(allUpdates.sort((a, b) => (b.date || '').localeCompare(a.date || '')));
+  }, [files]);
+  useEffect(() => {
+    if (chartInstance.current) {
+      chartInstance.current.destroy();
+      chartInstance.current = null;
+    }
+    if (!chartRef.current || updates.length === 0) return;
+    const dated = updates.filter(u => u.date);
+    if (dated.length === 0) return;
+    const dateCounts = {
+      success: {},
+      failed: {}
+    };
+    dated.forEach(u => {
+      const day = (u.date || '').slice(0, 10);
+      if (u.status === 'failed') dateCounts.failed[day] = (dateCounts.failed[day] || 0) + 1;else dateCounts.success[day] = (dateCounts.success[day] || 0) + 1;
+    });
+    const allDays = [...new Set([...Object.keys(dateCounts.success), ...Object.keys(dateCounts.failed)])].sort();
+    chartInstance.current = new Chart(chartRef.current.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: allDays,
+        datasets: [{
+          label: 'Success',
+          data: allDays.map(d => dateCounts.success[d] || 0),
+          backgroundColor: '#3fb95088',
+          borderColor: '#3fb950',
+          borderWidth: 1,
+          borderRadius: 4
+        }, {
+          label: 'Failed',
+          data: allDays.map(d => dateCounts.failed[d] || 0),
+          backgroundColor: '#f8514988',
+          borderColor: '#f85149',
+          borderWidth: 1,
+          borderRadius: 4
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            labels: {
+              color: '#e6edf3'
+            }
+          }
+        },
+        scales: {
+          x: {
+            stacked: true,
+            grid: {
+              display: false
+            },
+            ticks: {
+              color: '#8b949e',
+              maxRotation: 45,
+              font: {
+                size: 10
+              }
+            }
+          },
+          y: {
+            stacked: true,
+            grid: {
+              color: '#30363d'
+            },
+            ticks: {
+              color: '#8b949e',
+              stepSize: 1
+            },
+            beginAtZero: true
+          }
+        }
+      }
+    });
+    return () => {
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+        chartInstance.current = null;
+      }
+    };
+  }, [updates]);
+  const versions = updates.filter(u => u.version);
+  const attempts = updates.filter(u => u.action);
+  const successCount = attempts.filter(u => u.status === 'success').length;
+  const failCount = attempts.filter(u => u.status === 'failed').length;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "dashboard-container"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Versions Detected"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#58a6ff'
+    }
+  }, versions.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Successful Updates"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: '#3fb950'
+    }
+  }, successCount)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 14px',
+      backgroundColor: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: '8px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '11px',
+      color: '#8b949e'
+    }
+  }, "Failed Updates"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '20px',
+      fontWeight: 600,
+      color: failCount > 0 ? '#f85149' : '#3fb950'
+    }
+  }, failCount))), updates.filter(u => u.date).length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "chart-container",
+    style: {
+      height: '220px',
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("canvas", {
+    ref: chartRef
+  })), versions.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      fontWeight: 600,
+      color: '#e6edf3',
+      marginBottom: '8px'
+    }
+  }, "Version History"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: '300px',
+      overflowY: 'auto'
+    }
+  }, versions.map((v, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '12px',
+      padding: '8px 10px',
+      borderBottom: '1px solid #21262d',
+      fontSize: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      padding: '2px 10px',
+      borderRadius: '12px',
+      backgroundColor: '#58a6ff22',
+      color: '#58a6ff',
+      fontWeight: 600,
+      fontSize: '12px',
+      fontFamily: 'monospace'
+    }
+  }, 'v' + v.version), v.build && /*#__PURE__*/React.createElement("span", {
+    style: {
+      padding: '1px 6px',
+      borderRadius: '8px',
+      backgroundColor: '#21262d',
+      color: '#8b949e',
+      fontSize: '11px',
+      fontFamily: 'monospace'
+    }
+  }, v.build), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#8b949e',
+      fontSize: '11px'
+    }
+  }, v.date || 'Unknown date'), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      fontSize: '11px',
+      marginLeft: 'auto'
+    }
+  }, v.source.split('/').pop()))))), attempts.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: '16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: '13px',
+      fontWeight: 600,
+      color: '#e6edf3',
+      marginBottom: '8px'
+    }
+  }, "Update Attempts"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: '300px',
+      overflowY: 'auto'
+    }
+  }, attempts.map((a, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '12px',
+      padding: '6px 10px',
+      borderBottom: '1px solid #21262d',
+      fontSize: '12px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      padding: '1px 8px',
+      borderRadius: '8px',
+      fontSize: '11px',
+      fontWeight: 600,
+      backgroundColor: a.status === 'success' ? '#3fb95022' : '#f8514922',
+      color: a.status === 'success' ? '#3fb950' : '#f85149'
+    }
+  }, a.status), a.action && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#8b949e',
+      textTransform: 'capitalize'
+    }
+  }, a.action), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#8b949e',
+      fontSize: '11px'
+    }
+  }, a.date), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: '#6e7681',
+      fontSize: '11px',
+      marginLeft: 'auto'
+    }
+  }, a.source.split('/').pop()))))), /*#__PURE__*/React.createElement(CollapsibleFileList, {
+    files: sectionFiles,
+    selectedFile: selectedFile,
+    setSelectedFile: setSelectedFile
+  }));
+}
 const sectionConfig = [{
   id: 1,
   title: 'Unified System Log',
@@ -4739,7 +8745,7 @@ const sectionConfig = [{
   id: 5,
   title: 'Networking',
   icon: '🌐',
-  prefixes: ['logs/Networking/', 'logs/NetworkRelay/', 'WiFi/'],
+  prefixes: ['logs/Networking/', 'logs/NetworkRelay/', 'WiFi/', 'ifconfig.txt', 'netstat.txt', 'netstat'],
   description: 'Wi-Fi connections, cellular data, and network diagnostics'
 }, {
   id: 6,
@@ -4808,6 +8814,66 @@ const sectionConfig = [{
   prefixes: ['logs/MobileActivation/', 'logs/FDR/', 'logs/MobileLockdown/'],
   description: 'Device activation, provisioning, and lockdown state'
 }, {
+  id: 18,
+  title: 'Per-App Battery Drain',
+  icon: '📊',
+  prefixes: ['logs/BatteryUIPlist/', 'logs/BatteryLife/'],
+  description: 'Per-app battery usage breakdown from BatteryUI plist data'
+}, {
+  id: 19,
+  title: 'Battery Gauge (IOService)',
+  icon: '🔌',
+  prefixes: ['ioreg/'],
+  description: 'Battery gauge parameters from IOService registry (Qmax, Ra, CycleCount)'
+}, {
+  id: 20,
+  title: 'Charging Behavior',
+  icon: '⚡',
+  prefixes: ['logs/BatteryBDC/'],
+  description: 'Charging curves and behavior from BDC_OBC CSV data'
+}, {
+  id: 21,
+  title: 'WiFi History',
+  icon: '📶',
+  prefixes: ['WiFi/', 'logs/Networking/'],
+  description: 'Known WiFi networks, connection history, and signal strength'
+}, {
+  id: 22,
+  title: 'Jetsam Deep Dive',
+  icon: '🧹',
+  prefixes: ['crashes_and_spins/JetsamEvent'],
+  description: 'Memory pressure events, killed processes, and memory usage analysis'
+}, {
+  id: 23,
+  title: 'Thermal Monitor',
+  icon: '🌡️',
+  prefixes: ['logs/pmudiagnose/', 'smcDiagnose.txt'],
+  description: 'Thermal state timeline, CPU/GPU temperatures, and throttling events'
+}, {
+  id: 24,
+  title: 'Security Overview',
+  icon: '🛡️',
+  prefixes: ['security-sysdiagnose.txt', 'ckksctl_status.txt', 'otctl_status.txt', 'pcsstatus.txt', 'transparency.log'],
+  description: 'Security profiles, certificates, code signing, and trust status'
+}, {
+  id: 25,
+  title: 'Software Update History',
+  icon: '🔄',
+  prefixes: ['logs/MobileSoftwareUpdate/', 'logs/OTAUpdateLogs/', 'logs/StagingLogs/'],
+  description: 'iOS version timeline, update attempts, success and failure history'
+}, {
+  id: 26,
+  title: 'PowerLog SQL Explorer',
+  icon: '\uD83D\uDD0C',
+  prefixes: ['logs/powerlogs/'],
+  description: 'Query the PowerLog PLSQL database directly with preset or custom SQL queries'
+}, {
+  id: 27,
+  title: 'Process Resource Analysis',
+  icon: '\uD83D\uDCCA',
+  prefixes: ['taskinfo.txt'],
+  description: 'Per-process CPU time, memory usage, and thread counts from taskinfo'
+}, {
   id: 17,
   title: 'Other Logs & Data',
   icon: '📁',
@@ -4827,7 +8893,7 @@ function SectionComponent({
   let sectionFiles;
   if (config.id === 17) {
     const matchedPrefixes = new Set();
-    sectionConfig.slice(0, 16).forEach(c => {
+    sectionConfig.filter(c => c.id !== 17).forEach(c => {
       c.prefixes.forEach(p => matchedPrefixes.add(p));
     });
     sectionFiles = files.filter(f => {
@@ -4909,6 +8975,39 @@ function SectionComponent({
     files: allFiles,
     sectionFiles: sectionFiles
   }) : config.id === 6 ? /*#__PURE__*/React.createElement(StorageDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 18 ? /*#__PURE__*/React.createElement(BatteryDrainDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 19 ? /*#__PURE__*/React.createElement(BatteryGaugeDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 20 ? /*#__PURE__*/React.createElement(ChargingDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 21 ? /*#__PURE__*/React.createElement(WiFiDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 22 ? /*#__PURE__*/React.createElement(JetsamDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 23 ? /*#__PURE__*/React.createElement(ThermalDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 24 ? /*#__PURE__*/React.createElement(SecurityDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 25 ? /*#__PURE__*/React.createElement(UpdateHistoryDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 5 ? /*#__PURE__*/React.createElement(NetworkDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 26 ? /*#__PURE__*/React.createElement(PowerLogDashboard, {
+    files: allFiles,
+    sectionFiles: sectionFiles
+  }) : config.id === 27 ? /*#__PURE__*/React.createElement(ProcessDashboard, {
     files: allFiles,
     sectionFiles: sectionFiles
   }) : /*#__PURE__*/React.createElement(FileExplorerDashboard, {

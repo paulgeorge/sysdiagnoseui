@@ -2188,7 +2188,7 @@ function CrashDetailView({ fileData, crashInfo }) {
       const decoder = new TextDecoder('utf-8', { fatal: false });
       const buf = fileData instanceof ArrayBuffer ? new Uint8Array(fileData) : fileData;
       const text = decoder.decode(buf);
-      const parsed: any = {};
+      const parsed = {};
 
       // Try JSON parse (most IPS files are JSON or have JSON after a header line)
       let json = null;

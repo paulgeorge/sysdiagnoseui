@@ -721,17 +721,19 @@ class TarParser {
     return TarParser._extractGz(file, onProgress);
   }
   static async _extractWrapper(file, onProgress) {
-    // Scan the plain tar for a nested .tar.gz/.tgz entry, write it to OPFS, then extract that
-    const opfsRoot = await navigator.storage.getDirectory();
+    // Scan the plain tar for a nested .tar.gz/.tgz entry, extract it, then process
+    let useOPFS = false;
+    let opfsRoot;
+    try {
+      opfsRoot = await navigator.storage.getDirectory();
+      useOPFS = true;
+    } catch (_) {}
     const decoder = new TextDecoder();
     const reader = file.stream().getReader();
     let buffer = new Uint8Array(0);
     let offset = 0;
-    let found = false;
     const totalSize = file.size;
     onProgress(2, 'Scanning wrapper tar...');
-
-    // Read enough to find the first .tar.gz entry header
     const readMore = async needed => {
       while (buffer.length - offset < needed) {
         const {
@@ -746,12 +748,9 @@ class TarParser {
         offset = 0;
       }
     };
-
-    // Parse tar headers until we find a .tar.gz
     while (true) {
       await readMore(512);
       const header = buffer.subarray(offset, offset + 512);
-      // Check null block
       let allZero = true;
       for (let i = 0; i < 512; i++) {
         if (header[i] !== 0) {
@@ -767,55 +766,74 @@ class TarParser {
       const fullName = (prefix ? prefix + '/' + name : name).replace(/\0+$/, '');
       offset += 512;
       if (fullName.endsWith('.tar.gz') || fullName.endsWith('.tgz')) {
-        // Stream this entry's data to an OPFS file
         onProgress(5, 'Extracting inner archive...');
-        const innerName = '_sysdiagnose_inner_' + Date.now() + '.tar.gz';
-        const innerHandle = await opfsRoot.getFileHandle(innerName, {
-          create: true
-        });
-        const writable = await innerHandle.createWritable();
-        let remaining = entrySize;
-        // Write whatever we already have buffered
-        const buffered = Math.min(remaining, buffer.length - offset);
-        if (buffered > 0) {
-          await writable.write(buffer.subarray(offset, offset + buffered));
-          remaining -= buffered;
-          offset += buffered;
+        if (useOPFS) {
+          // Stream to OPFS file (low memory)
+          const innerName = '_sysdiagnose_inner_' + Date.now() + '.tar.gz';
+          const innerHandle = await opfsRoot.getFileHandle(innerName, {
+            create: true
+          });
+          const writable = await innerHandle.createWritable();
+          let remaining = entrySize;
+          const buffered = Math.min(remaining, buffer.length - offset);
+          if (buffered > 0) {
+            await writable.write(buffer.subarray(offset, offset + buffered));
+            remaining -= buffered;
+            offset += buffered;
+          }
+          while (remaining > 0) {
+            const {
+              done,
+              value
+            } = await reader.read();
+            if (done) break;
+            const toWrite = value.subarray(0, Math.min(value.length, remaining));
+            await writable.write(toWrite);
+            remaining -= toWrite.length;
+            onProgress(Math.min(45, 5 + (entrySize - remaining) / entrySize * 40), 'Extracting inner archive...');
+          }
+          await writable.close();
+          const innerFile = await innerHandle.getFile();
+          const innerBlob = new File([innerFile], fullName.split('/').pop());
+          const result = await TarParser._extractGz(innerBlob, onProgress);
+          try {
+            await opfsRoot.removeEntry(innerName);
+          } catch (_) {}
+          return result;
+        } else {
+          // In-memory fallback: collect inner .tar.gz into chunks
+          const chunks = [];
+          let remaining = entrySize;
+          const buffered = Math.min(remaining, buffer.length - offset);
+          if (buffered > 0) {
+            chunks.push(buffer.slice(offset, offset + buffered));
+            remaining -= buffered;
+            offset += buffered;
+          }
+          while (remaining > 0) {
+            const {
+              done,
+              value
+            } = await reader.read();
+            if (done) break;
+            const toWrite = value.subarray(0, Math.min(value.length, remaining));
+            chunks.push(new Uint8Array(toWrite));
+            remaining -= toWrite.length;
+            onProgress(Math.min(45, 5 + (entrySize - remaining) / entrySize * 40), 'Extracting inner archive...');
+          }
+          const innerBlob = new File(chunks, fullName.split('/').pop());
+          return TarParser._extractGz(innerBlob, onProgress);
         }
-        // Stream the rest directly from the file reader
-        while (remaining > 0) {
-          const {
-            done,
-            value
-          } = await reader.read();
-          if (done) break;
-          const toWrite = value.subarray(0, Math.min(value.length, remaining));
-          await writable.write(toWrite);
-          remaining -= toWrite.length;
-          const pct = 5 + (entrySize - remaining) / entrySize * 40;
-          onProgress(Math.min(45, pct), 'Extracting inner archive...');
-        }
-        await writable.close();
-        // Now extract the inner .tar.gz via OPFS
-        const innerFile = await innerHandle.getFile();
-        const innerBlob = new File([innerFile], fullName.split('/').pop());
-        const result = await TarParser._extractGz(innerBlob, onProgress);
-        try {
-          await opfsRoot.removeEntry(innerName);
-        } catch (_) {}
-        return result;
       }
 
       // Skip this entry's data
       const dataBlocks = Math.ceil(entrySize / 512) * 512;
-      // Discard buffered data for this entry
       const bufferedData = buffer.length - offset;
       if (bufferedData >= dataBlocks) {
         offset += dataBlocks;
       } else {
-        // Need to read and discard from stream
         let toSkip = dataBlocks - bufferedData;
-        offset = buffer.length; // consumed all buffer
+        offset = buffer.length;
         while (toSkip > 0) {
           const {
             done,
@@ -832,16 +850,51 @@ class TarParser {
     throw new Error('No .tar.gz sysdiagnose found inside wrapper tar');
   }
   static async _extractGz(file, onProgress) {
-    // Stream decompress .tar.gz → OPFS temp file (never holds full tar in RAM)
-    const opfsRoot = await navigator.storage.getDirectory();
-    const tempName = '_sysdiagnose_temp_' + Date.now() + '.tar';
-    const tempHandle = await opfsRoot.getFileHandle(tempName, {
-      create: true
-    });
-    const writable = await tempHandle.createWritable();
-    let totalWritten = 0;
-    const compressedSize = file.size;
+    // Try OPFS (works on HTTPS/localhost), fall back to in-memory (works on file://)
+    let useOPFS = false;
+    let opfsRoot, tempHandle, tarData;
     try {
+      opfsRoot = await navigator.storage.getDirectory();
+      useOPFS = true;
+    } catch (_) {
+      // OPFS not available (e.g. file:// protocol) — decompress to RAM
+    }
+    const compressedSize = file.size;
+    if (useOPFS) {
+      // Stream decompress to OPFS temp file (low memory)
+      const tempName = '_sysdiagnose_temp_' + Date.now() + '.tar';
+      tempHandle = await opfsRoot.getFileHandle(tempName, {
+        create: true
+      });
+      const writable = await tempHandle.createWritable();
+      let totalWritten = 0;
+      try {
+        const inputStream = file.stream().pipeThrough(new DecompressionStream('gzip'));
+        const reader = inputStream.getReader();
+        while (true) {
+          const {
+            done,
+            value
+          } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+          totalWritten += value.length;
+          onProgress(Math.min(48, totalWritten / (compressedSize * 3.5) * 50), 'Decompressing to disk...');
+        }
+        await writable.close();
+      } catch (e) {
+        try {
+          await writable.close();
+        } catch (_) {}
+        try {
+          await opfsRoot.removeEntry(tempName);
+        } catch (_) {}
+        throw e;
+      }
+    } else {
+      // In-memory decompression fallback
+      const chunks = [];
+      let totalWritten = 0;
       const inputStream = file.stream().pipeThrough(new DecompressionStream('gzip'));
       const reader = inputStream.getReader();
       while (true) {
@@ -850,43 +903,51 @@ class TarParser {
           value
         } = await reader.read();
         if (done) break;
-        await writable.write(value);
+        chunks.push(value);
         totalWritten += value.length;
-        const est = Math.min(48, totalWritten / (compressedSize * 3.5) * 50);
-        onProgress(est, 'Decompressing to disk...');
+        onProgress(Math.min(48, totalWritten / (compressedSize * 3.5) * 50), 'Decompressing to memory...');
       }
-      await writable.close();
-    } catch (e) {
-      try {
-        await writable.close();
-      } catch (_) {}
-      try {
-        await opfsRoot.removeEntry(tempName);
-      } catch (_) {}
-      throw e;
+      // Concatenate chunks into single ArrayBuffer
+      tarData = new Uint8Array(totalWritten);
+      let pos = 0;
+      for (const chunk of chunks) {
+        tarData.set(chunk, pos);
+        pos += chunk.length;
+      }
+      chunks.length = 0; // free references
     }
     onProgress(50, 'Parsing tar archive...');
 
-    // Parse tar entries using chunked buffered reads (avoids excessive file.slice calls)
-    const tarFile = await tempHandle.getFile();
-    const tarSize = tarFile.size;
+    // Set up a unified read interface for both OPFS and in-memory
     const decoder = new TextDecoder();
+    let tarSize, tarFile;
+    if (useOPFS) {
+      tarFile = await tempHandle.getFile();
+      tarSize = tarFile.size;
+    } else {
+      tarSize = tarData.length;
+    }
 
     // Buffered reader: reads large chunks to minimize file resource calls
     const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks
     let chunkBuf = null;
-    let chunkStart = -1; // file offset where chunkBuf starts
+    let chunkStart = -1;
     let chunkLen = 0;
     const ensureBuffered = async (fileOffset, needed) => {
-      // If the requested range is within our current buffer, no-op
       if (chunkBuf && fileOffset >= chunkStart && fileOffset + needed <= chunkStart + chunkLen) {
         return;
       }
-      // Read a new chunk from the file
-      const readSize = Math.max(CHUNK_SIZE, needed);
-      const end = Math.min(fileOffset + readSize, tarSize);
-      const blob = tarFile.slice(fileOffset, end);
-      chunkBuf = new Uint8Array(await blob.arrayBuffer());
+      if (useOPFS) {
+        const readSize = Math.max(CHUNK_SIZE, needed);
+        const end = Math.min(fileOffset + readSize, tarSize);
+        const blob = tarFile.slice(fileOffset, end);
+        chunkBuf = new Uint8Array(await blob.arrayBuffer());
+      } else {
+        // For in-memory, just point into the tarData buffer directly
+        const readSize = Math.max(CHUNK_SIZE, needed);
+        const end = Math.min(fileOffset + readSize, tarSize);
+        chunkBuf = tarData.subarray(fileOffset, end);
+      }
       chunkStart = fileOffset;
       chunkLen = chunkBuf.length;
     };
@@ -917,7 +978,7 @@ class TarParser {
         offset += 512;
         if (offset < tarSize - 512) {
           const nextBuf = await readBytes(offset, 512);
-          if (isNullBlock(nextBuf)) break; // double null = end of archive
+          if (isNullBlock(nextBuf)) break;
         } else break;
         continue;
       }
@@ -926,13 +987,10 @@ class TarParser {
       const typeFlag = readStr(headerBuf, 156, 1);
       const prefix = readStr(headerBuf, 345, 155);
       const fullName = (prefix ? prefix + '/' + name : name).replace(/\0+$/, '');
-      offset += 512; // past header
-
+      offset += 512;
       const isFileEntry = typeFlag === '0' || typeFlag === '' || !typeFlag && size > 0;
       const isDir = typeFlag === '5' || fullName.endsWith('/');
       const baseName = fullName.split('/').pop() || '';
-
-      // Skip macOS resource fork files
       if (!baseName.startsWith('._') && fullName && fullName !== 'pax_global_header') {
         const entry = {
           name: fullName,
@@ -943,9 +1001,7 @@ class TarParser {
         const isPLSQL = fullName.endsWith('.PLSQL') || fullName.endsWith('.EPSQL');
         const maxSize = isPLSQL ? 200 * 1024 * 1024 : 2 * 1024 * 1024;
         if (isFileEntry && !isDir && size > 0 && size < maxSize) {
-          // Read file data from buffered chunks — no extra file.slice per entry
           const fileData = await readBytes(offset, size);
-          // Must copy since readBytes returns a subarray of the shared chunk buffer
           const copied = new Uint8Array(size);
           copied.set(fileData);
           entry.data = isPLSQL ? copied : copied.buffer.slice(copied.byteOffset, copied.byteOffset + copied.byteLength);
@@ -954,21 +1010,24 @@ class TarParser {
         entries.push(entry);
         entryCount++;
       }
-
-      // Advance past data blocks (512-byte aligned)
       const dataBlocks = Math.ceil(size / 512);
       offset += dataBlocks * 512;
       if (entryCount % 200 === 0) {
         const pct = 52 + offset / tarSize * 48;
         onProgress(Math.min(99, pct), `Parsing entries... (${entryCount} found)`);
-        await new Promise(r => setTimeout(r, 0)); // yield to UI
+        await new Promise(r => setTimeout(r, 0));
       }
     }
 
-    // Clean up OPFS temp file
-    try {
-      await opfsRoot.removeEntry(tempName);
-    } catch (_) {}
+    // Clean up
+    if (useOPFS) {
+      const tempName = '_sysdiagnose_temp_' + Date.now() + '.tar';
+      try {
+        await opfsRoot.removeEntry(tempName);
+      } catch (_) {}
+    }
+    tarData = null; // free in-memory buffer
+
     onProgress(100, 'Complete');
     return entries;
   }
